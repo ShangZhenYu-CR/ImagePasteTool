@@ -1,0 +1,411 @@
+        raise MemoryError("GlobalAlloc failed")
+
+    ptr = kernel32.GlobalLock(hmem)
+    if not ptr:
+        kernel32.GlobalFree(hmem)
+        raise MemoryError("GlobalLock failed")
+
+    try:
+        ctypes.memmove(ptr, data, len(data))
+    finally:
+        kernel32.GlobalUnlock(hmem)
+
+    _tool_clipboard_write_begin()
+    try:
+        if not open_clipboard(retries=20, delay=0.01):
+            kernel32.GlobalFree(hmem)
+            raise OSError("Clipboard busy")
+
+        try:
+            if not user32.EmptyClipboard():
+                kernel32.GlobalFree(hmem)
+                raise OSError("EmptyClipboard failed")
+            result = user32.SetClipboardData(CF_UNICODETEXT, hmem)
+            if not result:
+                kernel32.GlobalFree(hmem)
+                raise OSError("SetClipboardData(CF_UNICODETEXT) failed")
+        finally:
+            user32.CloseClipboard()
+    finally:
+        _tool_clipboard_write_end()
+
+
+
+
+def _handle_folder_dialog(win, folder):
+    try:
+        win.set_focus()
+    except Exception:
+        pass
+
+    # Windows Common Item Dialog / Explorer-style folder picker.
+    try:
+        send_keys('^l')
+        time.sleep(0.04)
+        send_keys(_escape_send_keys_text(str(folder)), with_spaces=True)
+        send_keys('{ENTER}')
+        time.sleep(0.16)
+        send_keys('{ENTER}')
+        return True
+    except Exception:
+        pass
+
+    # UIA fallback: set a path-like edit and click the affirmative button.
+    try:
+        edits = win.descendants(control_type='Edit')
+        if edits:
+            edits[-1].set_edit_text(str(folder))
+        for b in win.descendants(control_type='Button'):
+            name = _safe_text(b).strip().lower()
+            if name in ('select folder', 'choose folder', 'ok', '确定', '选择文件夹', '选择'):
+                b.click_input()
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _try_select_png(win):
+    try:
+        for combo in win.descendants(control_type='ComboBox'):
+            try:
+                items = combo.item_texts()
+            except Exception:
+                items = []
+            for item in items:
+                if str(item).strip().lower() in ('png', '.png', 'png image'):
+                    try:
+                        combo.select(item)
+                        return True
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return False
+
+
+def _try_set_export_path(win, folder):
+    path_keys = ('path', 'folder', 'directory', 'location', 'destination',
+                 '路径', '文件夹', '目录', '位置', '保存到', '导出到')
+    candidates = []
+    try:
+        for edit in win.descendants(control_type='Edit'):
+            name = (_safe_text(edit) + ' ' + str(getattr(edit.element_info, 'name', '') or '')).lower()
+            try:
+                value = edit.get_value() or ''
+            except Exception:
+                value = ''
+            score = 0
+            if any(k in name for k in path_keys):
+                score += 4
+            if ':\\' in value or value.startswith('\\\\') or '/' in value:
+                score += 3
+            if value and Path(value).exists():
+                score += 2
+            candidates.append((score, edit))
+    except Exception:
+        return False
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    if candidates and candidates[0][0] >= 2:
+        try:
+            candidates[0][1].set_edit_text(str(folder))
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def _click_button_by_words(win, words):
+    try:
+        for b in win.descendants(control_type='Button'):
+            name = _safe_text(b).strip().lower().replace('&', '')
+            if any(w in name for w in words):
+                b.click_input()
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _list_exported_images(folder):
+    files = []
+    try:
+        for p in Path(folder).iterdir():
+            if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS:
+                files.append(p)
+    except Exception:
+        pass
+    # PureRef exports items sequentially; creation time best preserves that order.
+    files.sort(key=lambda p: (p.stat().st_ctime_ns, p.name.lower()))
+    return files
+
+
+def _get_window_title_fast(hwnd):
+    try:
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        return buf.value
+    except Exception:
+        return ""
+
+
+def _get_window_rect_fast(hwnd):
+    rect = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+    return rect
+
+
+
+def _pureref_io_snapshot(pid):
+    """Return PureRef process write activity counters.
+
+    This is a stronger signal than 'one file currently exists':
+    if WriteTransferCount / WriteOperationCount is still increasing, PureRef
+    itself is still doing output work and the export session cannot be complete.
+    """
+    handle = kernel32.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION,
+        False,
+        int(pid)
+    )
+    if not handle:
+        return None
+
+    try:
+        counters = IO_COUNTERS()
+        if not kernel32.GetProcessIoCounters(
+            handle, ctypes.byref(counters)
+        ):
+            return None
+        return (
+            int(counters.WriteOperationCount),
+            int(counters.WriteTransferCount),
+        )
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _filetime_to_int(value):
+    return (
+        (int(value.dwHighDateTime) << 32)
+        | int(value.dwLowDateTime)
+    )
+
+
+def _pureref_cpu_snapshot(pid):
+    """Return cumulative PureRef process CPU time in 100-ns units."""
+    handle = kernel32.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION,
+        False,
+        int(pid)
+    )
+    if not handle:
+        return None
+
+    try:
+        creation = PROCESS_FILETIME()
+        exit_time = PROCESS_FILETIME()
+        kernel = PROCESS_FILETIME()
+        user = PROCESS_FILETIME()
+
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel),
+            ctypes.byref(user)
+        ):
+            return None
+
+        return (
+            _filetime_to_int(kernel)
+            + _filetime_to_int(user)
+        )
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+
+
+def _pureref_export_dialog_exists(pid, main_hwnd):
+    return bool(_find_pureref_export_dialog_win32(pid, main_hwnd))
+
+
+def _verify_exported_images(files):
+    """Verify all current exported files can be decoded completely."""
+    if not files:
+        return False
+
+    for p in files:
+        try:
+            with Image.open(p) as im:
+                im.verify()
+        except Exception:
+            return False
+    return True
+
+
+
+def _find_pureref_export_dialog_win32(pid, main_hwnd):
+    """Very fast PureRef export-dialog lookup using EnumWindows only.
+
+    This avoids constructing pywinauto wrappers / UIA trees while waiting for
+    PureRef's dialog. On a normal machine this scan is typically a few ms.
+    """
+    result = {"hwnd": None}
+    target_pid = int(pid)
+    main_hwnd_int = int(main_hwnd)
+
+    WNDENUMPROC = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+    )
+
+    @WNDENUMPROC
+    def enum_proc(hwnd, lparam):
+        try:
+            if int(hwnd) == main_hwnd_int:
+                return True
+            if not user32.IsWindowVisible(hwnd):
+                return True
+
+            proc_id = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc_id))
+            if int(proc_id.value) != target_pid:
+                return True
+
+            title = _get_window_title_fast(hwnd).strip().lower()
+            if any(k in title for k in (
+                '导出图像', '导出图片', 'export image', 'export images'
+            )):
+                result["hwnd"] = int(hwnd)
+                return False
+        except Exception:
+            pass
+        return True
+
+    try:
+        user32.EnumWindows(enum_proc, 0)
+    except Exception:
+        return None
+
+    return result["hwnd"]
+
+
+
+def _drive_pureref_custom_export_dialog(pid, main_hwnd, folder, driven_handles):
+    """Drive PureRef export dialog immediately via HWND + screen coordinates."""
+    hwnd = _find_pureref_export_dialog_win32(pid, main_hwnd)
+    if not hwnd or int(hwnd) in driven_handles:
+        return False
+
+    try:
+        rect = _get_window_rect_fast(hwnd)
+        if rect is None:
+            return False
+
+        left, top = rect.left, rect.top
+        width = rect.right - rect.left
+        height = rect.bottom - rect.top
+        if width < 280 or height < 250:
+            return False
+
+        # Do not build any UI Automation tree. Bring only this window forward.
+        try:
+            user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+
+        folder_text = str(Path(folder).resolve())
+        _write_clipboard_unicode_text(folder_text)
+
+        # User-verified PureRef 2.1 geometry.
+        path_xy = (
+            left + int(width * 0.520),
+            top + int(height * 0.215)
+        )
+        mouse.click(button='left', coords=path_xy)
+        # Tiny yield only; whole path goes in with one Ctrl+V.
+        time.sleep(0.008)
+        send_keys('^a')
+        send_keys('^v')
+        time.sleep(0.008)
+
+        export_xy = (
+            left + int(width * 0.316),
+            top + int(height * 0.852)
+        )
+        mouse.click(button='left', coords=export_xy)
+        driven_handles.add(int(hwnd))
+        log(f'PureRef：快速 Win32 路径粘贴并点击导出：{folder_text}')
+        return True
+
+    except Exception as e:
+        log(f'PureRef Win32 快速自动化失败：{e}')
+        return False
+
+
+
+def automate_pureref_export(pid, main_hwnd, folder, timeout=None):
+    """Authoritative PureRef export-session state machine.
+
+    Completion requires ALL of these:
+      1) the export command was actually driven,
+      2) PureRef's export dialog has closed after Export was clicked,
+      3) PureRef process write I/O has become idle,
+      4) PureRef process CPU has become idle,
+      5) the exported file set is stable,
+      6) every exported image verifies as readable.
+
+    Clipboard contents are never used to decide PureRef capture count.
+    """
+    with CONFIG_LOCK:
+        inactivity_timeout = int(
+            CONFIG.get("pureref_export_timeout_sec", 8)
+        ) if timeout is None else int(timeout)
+        hard_timeout = int(
+            CONFIG.get("pureref_export_hard_timeout_sec", 120)
+        )
+        settle_sec = (
+            int(CONFIG.get("pureref_export_settle_ms", 600)) / 1000.0
+        )
+        io_idle_sec = (
+            int(CONFIG.get("pureref_process_io_idle_ms", 900)) / 1000.0
+        )
+        cpu_idle_sec = (
+            int(CONFIG.get("pureref_process_cpu_idle_ms", 1500)) / 1000.0
+        )
+        cpu_threshold_100ns = int(
+            float(CONFIG.get("pureref_cpu_activity_threshold_ms", 1.0))
+            * 10000.0
+        )
+        dialog_close_grace_sec = (
+            int(CONFIG.get("pureref_dialog_close_grace_ms", 350)) / 1000.0
+        )
+        single_file_confirm_sec = (
+            int(CONFIG.get("pureref_single_file_confirm_ms", 5000)) / 1000.0
+        )
+        multi_file_confirm_sec = (
+            int(CONFIG.get("pureref_multi_file_confirm_ms", 900)) / 1000.0
+        )
+
+    custom_driven = set()
+    stable_snapshot = None
+    stable_since = None
+    first_file_seen_at = None
+
+    started = time.perf_counter()
+    last_activity = started
+
+    export_command_driven = False
+    export_dialog_seen = False
+    export_dialog_closed_at = None
+
+    last_io = _pureref_io_snapshot(pid)
+    last_io_activity = started
+
+    last_cpu = _pureref_cpu_snapshot(pid)
