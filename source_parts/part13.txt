@@ -1,0 +1,183 @@
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
+            )
+        except Exception:
+            pass
+
+        self.is_showing = True
+
+    def _busy_tick(self):
+        if not self.is_showing:
+            self.busy_job = None
+            return
+
+        width = max(1, self.canvas.winfo_width())
+        segment = max(44, int(width * 0.26))
+        travel = width + segment
+        x = int((self.busy_phase % 1.0) * travel) - segment
+        self.canvas.coords(self.bar, x, 0, x + segment, 8)
+        self.busy_phase = (self.busy_phase + 0.05) % 1.0
+        self.busy_job = self.top.after(40, self._busy_tick)
+
+    def show(self, stage, done=0, total=0, detail="", completed=False):
+        self._cancel_jobs()
+
+        if total > 0:
+            title = f"{stage}    {done} / {total}"
+        else:
+            title = stage
+
+        self.title.config(text=title)
+        self.detail.config(text=str(detail or ""))
+
+        self._show_noactivate()
+        self.canvas.update_idletasks()
+
+        width = max(1, self.canvas.winfo_width())
+        if total > 0:
+            ratio = min(1.0, max(0.0, float(done) / float(total)))
+            self.canvas.coords(self.bar, 0, 0, int(width * ratio), 8)
+        else:
+            self.busy_phase = 0.0
+            self._busy_tick()
+
+        if completed:
+            # Keep result visible long enough to read.
+            delay = 5000 if ("失败" in stage or "错误" in stage) else 2500
+            self.hide_job = self.top.after(delay, self.hide)
+
+    def notice(self, message):
+        """General app notice shown in this same app-owned window."""
+        self.show("ImagePasteTool", 0, 0, str(message), completed=True)
+
+    def hide(self):
+        self._cancel_jobs()
+        self.is_showing = False
+        try:
+            self.top.withdraw()
+        except Exception:
+            pass
+
+
+
+
+# --- Main ---------------------------------------------------------------------
+
+def process_ui_queue():
+    global settings_window, counter_overlay, progress_overlay, history_window
+    try:
+        while True:
+            kind, payload = UI_QUEUE.get_nowait()
+
+            if kind == "open_settings":
+                if settings_window is None:
+                    settings_window = SettingsWindow(root_tk)
+                settings_window.show()
+
+            elif kind == "open_history":
+                if history_window is None:
+                    history_window = HistoryWindow(root_tk)
+                history_window.show()
+
+            elif kind == "refresh":
+                if settings_window is not None:
+                    settings_window.refresh()
+
+            elif kind == "history_changed":
+                if (
+                    history_window is not None
+                    and history_window.top.winfo_viewable()
+                ):
+                    history_window.render()
+
+            elif kind == "status":
+                if settings_window is not None:
+                    settings_window.set_status(payload)
+
+            elif kind == "counter":
+                if counter_overlay is not None:
+                    counter_overlay.show(
+                        payload["done"],
+                        payload["total"],
+                        payload.get("completed", False)
+                    )
+
+            elif kind == "counter_hide":
+                if counter_overlay is not None:
+                    counter_overlay.hide()
+
+            elif kind == "progress":
+                if progress_overlay is not None:
+                    progress_overlay.show(
+                        payload.get("stage", "处理中"),
+                        payload.get("done", 0),
+                        payload.get("total", 0),
+                        payload.get("detail", ""),
+                        payload.get("completed", False)
+                    )
+
+            elif kind == "progress_hide":
+                if progress_overlay is not None:
+                    progress_overlay.hide()
+
+            elif kind == "app_notice":
+                if progress_overlay is not None:
+                    progress_overlay.notice(payload)
+
+            elif kind == "quit":
+                root_tk.quit()
+                return
+    except queue.Empty:
+        pass
+
+    root_tk.after(50, process_ui_queue)
+
+def main():
+    global root_tk, settings_window, counter_overlay, progress_overlay
+    global history_window
+
+    save_config()
+
+    # History retention is checked exactly ONCE per application startup.
+    cleanup_history_on_startup()
+
+    # Clear stale PureRef temp exports left by crashes/reboots.
+    try:
+        cutoff = time.time() - 24 * 3600
+        for d in PUREREF_TEMP_ROOT.iterdir():
+            if d.is_dir() and d.stat().st_mtime < cutoff:
+                shutil.rmtree(d, ignore_errors=True)
+    except Exception:
+        pass
+
+    # Hidden Tk root is the UI event loop. Settings stays hidden by default.
+    root_tk = tk.Tk()
+    root_tk.withdraw()
+
+    threading.Thread(target=hotkey_loop, daemon=True).start()
+    threading.Thread(target=tray_loop, daemon=True).start()
+    threading.Thread(
+        target=clipboard_history_monitor_loop,
+        daemon=True,
+        name="ClipboardHistoryMonitor"
+    ).start()
+
+    settings_window = SettingsWindow(root_tk)
+    settings_window.top.withdraw()
+
+    counter_overlay = CounterOverlay(root_tk)
+    progress_overlay = ProgressOverlay(root_tk)
+
+    cleanup_stale_batch_cache()
+
+    root_tk.after(20, process_ui_queue)
+    log(
+        f"程序已启动：粘贴 {CONFIG['hotkey']}；"
+        f"PureRef 捕获 {CONFIG['pureref_capture_hotkey']}；"
+        f"逐张 {CONFIG['one_by_one_hotkey']}；"
+        f"历史 {CONFIG['history_hotkey']}；"
+        f"PureRef 队列使用外部复制代次而非剪贴板序号"
+    )
+    root_tk.mainloop()
+
+if __name__ == "__main__":
+    main()
