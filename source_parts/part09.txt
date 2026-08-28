@@ -1,0 +1,360 @@
+            clear_batch_queue(hide_counter=True)
+
+    except Exception as e:
+        msg = str(e)
+        log(msg)
+        notify(msg)
+        with progress_lock:
+            pasted = progress_state["pasted"]
+        show_batch_progress(
+            "失败",
+            pasted, total,
+            msg,
+            completed=True
+        )
+        if batch_owned:
+            clear_batch_queue(hide_counter=True)
+
+    finally:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        log(f"边处理边粘贴缓存已清理：{cache_dir}")
+
+
+def paste_all_files(paths, notify_success, batch_owned=False):
+    """按设置选择：边处理边粘贴 / 全部处理完成后再粘贴。"""
+    with CONFIG_LOCK:
+        stream = bool(CONFIG.get("batch_stream_processing", True))
+
+    if stream:
+        return _paste_all_files_streaming(
+            paths,
+            notify_success,
+            batch_owned=batch_owned
+        )
+
+    return _paste_all_files_preload(
+        paths,
+        notify_success,
+        batch_owned=batch_owned
+    )
+
+
+def paste_next_from_queue(paths_if_new=None, notify_success=True):
+    """
+    One hotkey press = one image.
+    If paths_if_new is provided, it becomes a new batch.
+    """
+    global BATCH_DONE, LAST_COMPLETED_ONE_BY_ONE_SEQ, BATCH_HISTORY_ID
+
+    if paths_if_new is not None:
+        start_batch_queue(paths_if_new)
+
+    with BATCH_LOCK:
+        if not BATCH_QUEUE:
+            return False
+        path = BATCH_QUEUE[0]
+        total = BATCH_TOTAL
+        next_index = BATCH_DONE + 1
+
+    try:
+        with Image.open(path) as im:
+            img = normalize_image(im)
+
+        action, _ = process_one_image(
+            img,
+            Path(path).name,
+            "图片文件 / 逐张粘贴",
+            Path(path).stat().st_size
+        )
+
+        # Remember the clipboard sequence AFTER our own image rewrite.
+        mark_own_clipboard()
+
+        with BATCH_LOCK:
+            if BATCH_QUEUE and BATCH_QUEUE[0] == path:
+                BATCH_QUEUE.pop(0)
+                BATCH_DONE += 1
+            done = BATCH_DONE
+            remaining = len(BATCH_QUEUE)
+            total = BATCH_TOTAL
+
+        completed = remaining == 0
+        show_counter(done, total, completed=completed)
+
+        if notify_success and completed:
+            notify(f"这一批已全部粘贴完成：{done}/{total}")
+
+        if completed:
+            LAST_COMPLETED_ONE_BY_ONE_SEQ = clipboard_seq()
+            # Keep 当前/总数 briefly, but release temporary PureRef export files.
+            with BATCH_LOCK:
+                completed_source = BATCH_SOURCE
+            log(f"逐张批次完成：{done}/{total}")
+            if completed_source == "pureref":
+                clear_batch_queue(hide_counter=False, delete_temp=True)
+        else:
+            log(f"逐张进度：{done}/{total}，剩余 {remaining} 张")
+
+        return True
+
+    except Exception as e:
+        msg = f"处理失败：{Path(path).name} | {e}"
+        log(msg)
+        notify(msg)
+        return False
+
+def convert_and_paste():
+    if not WORK_LOCK.acquire(blocking=False):
+        return
+
+    try:
+        with CONFIG_LOCK:
+            notify_success = CONFIG["notify_success"]
+            batch_mode = CONFIG["batch_mode"]
+
+        # PureRef capture and history replay are remembered independent-file
+        # batches. They remain valid while the user only changes app focus.
+        with BATCH_LOCK:
+            remembered_pending = (
+                bool(BATCH_QUEUE)
+                and BATCH_SOURCE in ("pureref", "history")
+            )
+            remembered_paths = (
+                list(BATCH_QUEUE) if remembered_pending else []
+            )
+
+        if remembered_pending:
+            if not clipboard_was_replaced_by_user():
+                if batch_mode == "one":
+                    paste_next_from_queue(notify_success=notify_success)
+                else:
+                    paste_all_files(
+                        remembered_paths,
+                        notify_success,
+                        batch_owned=True
+                    )
+                return
+            clear_batch_queue(hide_counter=True)
+
+        # In one-by-one mode, if clipboard sequence is still the one created
+        # by our previous paste, continue the remembered file queue directly.
+        if batch_mode == "one":
+            with BATCH_LOCK:
+                has_pending = bool(BATCH_QUEUE)
+            if has_pending and not clipboard_was_replaced_by_user():
+                paste_next_from_queue(notify_success=notify_success)
+                return
+
+        # Clipboard changed, or this is the first press: read fresh source.
+        source = read_clipboard_source()
+
+        if source["kind"] == "image":
+            # A newly copied bitmap/screenshot is inherently one image.
+            clear_batch_queue(hide_counter=(batch_mode != "one"))
+            action, _ = process_one_image(
+                source["image"],
+                "直接复制的图像",
+                "剪贴板图像"
+            )
+            mark_own_clipboard()
+            if batch_mode == "one":
+                show_counter(1, 1, completed=True)
+            if notify_success:
+                notify(action)
+            return
+
+        if source["kind"] == "files":
+            paths = source["paths"]
+
+            if batch_mode == "one":
+                # New Ctrl+C creates/replaces the remembered queue.
+                paste_next_from_queue(
+                    paths_if_new=paths,
+                    notify_success=notify_success
+                )
+            else:
+                paste_all_files(paths, notify_success)
+            return
+
+        # Clipboard may contain our last pasted image while a one-by-one batch
+        # has just completed. Avoid treating that as an error.
+        with BATCH_LOCK:
+            pending = bool(BATCH_QUEUE)
+
+        if batch_mode == "one" and pending:
+            paste_next_from_queue(notify_success=notify_success)
+            return
+
+        msg = "剪贴板中没有检测到图片文件或图像内容"
+        log(msg)
+        notify(msg)
+
+    except Exception as e:
+        msg = f"处理失败：{e}"
+        log(msg)
+        notify(msg)
+    finally:
+        WORK_LOCK.release()
+
+
+def convert_and_paste_one_by_one():
+    """独立逐张快捷键：无论普通粘贴模式如何设置，每按一次只粘下一张。"""
+    global LAST_COMPLETED_ONE_BY_ONE_SEQ
+
+    if not WORK_LOCK.acquire(blocking=False):
+        return
+
+    try:
+        with CONFIG_LOCK:
+            notify_success = CONFIG["notify_success"]
+
+        # Existing PureRef / file queue first.
+        with BATCH_LOCK:
+            has_pending = bool(BATCH_QUEUE)
+
+        if has_pending and not clipboard_was_replaced_by_user():
+            paste_next_from_queue(notify_success=notify_success)
+            return
+
+        if has_pending:
+            clear_batch_queue(hide_counter=True)
+
+        current_seq = clipboard_seq()
+
+        # Prevent pressing the next-image shortcut again after the batch is
+        # already complete from duplicating the last pasted bitmap.
+        if (
+            LAST_COMPLETED_ONE_BY_ONE_SEQ is not None
+            and current_seq == LAST_COMPLETED_ONE_BY_ONE_SEQ
+        ):
+            notify("这一批已经粘贴完成，请先复制新图片")
+            return
+
+        source = read_clipboard_source()
+
+        if source["kind"] == "files":
+            LAST_COMPLETED_ONE_BY_ONE_SEQ = None
+            paste_next_from_queue(
+                paths_if_new=source["paths"],
+                notify_success=notify_success
+            )
+            return
+
+        if source["kind"] == "image":
+            LAST_COMPLETED_ONE_BY_ONE_SEQ = None
+            clear_batch_queue(hide_counter=True)
+            action, _ = process_one_image(
+                source["image"],
+                "直接复制的图像",
+                "剪贴板图像 / 独立逐张快捷键"
+            )
+            mark_own_clipboard()
+            show_counter(1, 1, completed=True)
+            LAST_COMPLETED_ONE_BY_ONE_SEQ = clipboard_seq()
+            if notify_success:
+                notify(action)
+            return
+
+        msg = "逐张粘贴：剪贴板中没有检测到图片文件或图像内容"
+        log(msg)
+        notify(msg)
+
+    except Exception as e:
+        msg = f"逐张粘贴失败：{e}"
+        log(msg)
+        notify(msg)
+    finally:
+        WORK_LOCK.release()
+
+
+# --- Hotkey thread ------------------------------------------------------------
+
+_registered_hotkey = None
+_registered_pureref_hotkey = None
+_registered_one_by_one_hotkey = None
+_registered_history_hotkey = None
+
+def register_current_hotkeys():
+    global _registered_hotkey, _registered_pureref_hotkey
+    global _registered_one_by_one_hotkey, _registered_history_hotkey
+    with CONFIG_LOCK:
+        paste_text = CONFIG["hotkey"]
+        pureref_text = CONFIG["pureref_capture_hotkey"]
+        one_text = CONFIG["one_by_one_hotkey"]
+        history_text = CONFIG["history_hotkey"]
+
+    _registered_hotkey = None
+    _registered_pureref_hotkey = None
+    _registered_one_by_one_hotkey = None
+    _registered_history_hotkey = None
+
+    try:
+        modifiers, vk = parse_hotkey(paste_text)
+        if user32.RegisterHotKey(None, HOTKEY_ID, modifiers, vk):
+            _registered_hotkey = paste_text
+            log(f"粘贴快捷键已启用：{paste_text}")
+        else:
+            notify(f"粘贴快捷键 {paste_text} 注册失败，可能已被其他程序占用")
+            log(f"粘贴快捷键注册失败：{paste_text}")
+    except Exception as e:
+        log(f"粘贴快捷键无效：{e}")
+
+    try:
+        modifiers, vk = parse_hotkey(pureref_text)
+        if user32.RegisterHotKey(None, PUREREF_HOTKEY_ID, modifiers, vk):
+            _registered_pureref_hotkey = pureref_text
+            log(f"PureRef 捕获快捷键已启用：{pureref_text}")
+        else:
+            notify(f"PureRef 捕获快捷键 {pureref_text} 注册失败，可能已被占用")
+            log(f"PureRef 捕获快捷键注册失败：{pureref_text}")
+    except Exception as e:
+        log(f"PureRef 捕获快捷键无效：{e}")
+
+    try:
+        modifiers, vk = parse_hotkey(one_text)
+        if user32.RegisterHotKey(
+            None, ONE_BY_ONE_HOTKEY_ID, modifiers, vk
+        ):
+            _registered_one_by_one_hotkey = one_text
+            log(f"逐张粘贴快捷键已启用：{one_text}")
+        else:
+            notify(
+                f"逐张粘贴快捷键 {one_text} 注册失败，可能已被占用"
+            )
+            log(f"逐张粘贴快捷键注册失败：{one_text}")
+    except Exception as e:
+        log(f"逐张粘贴快捷键无效：{e}")
+
+    try:
+        modifiers, vk = parse_hotkey(history_text)
+        if user32.RegisterHotKey(
+            None, HISTORY_HOTKEY_ID, modifiers, vk
+        ):
+            _registered_history_hotkey = history_text
+            log(f"历史剪贴板快捷键已启用：{history_text}")
+        else:
+            notify(
+                f"历史剪贴板快捷键 {history_text} 注册失败，可能已被占用"
+            )
+            log(f"历史剪贴板快捷键注册失败：{history_text}")
+    except Exception as e:
+        log(f"历史剪贴板快捷键无效：{e}")
+
+
+def hotkey_loop():
+    global hotkey_thread_id, _registered_hotkey, _registered_pureref_hotkey
+    global _registered_one_by_one_hotkey, _registered_history_hotkey
+    hotkey_thread_id = kernel32.GetCurrentThreadId()
+    register_current_hotkeys()
+
+    msg = wintypes.MSG()
+    while True:
+        result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+        if result <= 0:
+            break
+
+        if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID:
+            threading.Thread(target=convert_and_paste, daemon=True).start()
+
+        elif msg.message == WM_HOTKEY and msg.wParam == PUREREF_HOTKEY_ID:
+            threading.Thread(
