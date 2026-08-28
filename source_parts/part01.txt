@@ -1,0 +1,359 @@
+# -*- coding: utf-8 -*-
+"""
+ImagePasteTool V2
+Windows tray utility.
+
+Workflow:
+1) Copy image file(s) in Explorer OR copy actual image pixels/screenshot.
+2) Press global hotkey.
+3) Tool converts/normalizes clipboard to image data.
+4) If enabled, compresses only when the actual clipboard PNG exceeds 20/32 MB.
+5) Automatically pastes into the currently focused app.
+"""
+
+import ctypes
+from ctypes import wintypes
+import io
+import json
+import math
+import os
+from pathlib import Path
+import queue
+import shutil
+import tempfile
+import uuid
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+
+from PIL import Image, ImageOps, ImageDraw, ImageGrab, ImageTk
+import pystray
+from pystray import MenuItem as Item
+from pywinauto import Desktop, mouse
+from pywinauto.keyboard import send_keys
+
+APP_NAME = "ImagePasteTool"
+APP_VERSION = "2.3.6"
+APP_REG_NAME = "ImagePasteToolV2"
+
+SUPPORTED_EXTS = {
+    ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif"
+}
+
+DEFAULT_CONFIG = {
+    "hotkey": "ALT+WIN+V",
+    "pureref_capture_hotkey": "ALT+WIN+C",
+    "one_by_one_hotkey": "CTRL+ALT+WIN+V",
+    "history_hotkey": "CTRL+ALT+WIN+C",
+    "limit_mb": 20,
+    "compression_enabled": True,
+    "auto_paste": True,
+    "batch_mode": "all",
+    "batch_stream_processing": True,
+    "batch_paste_delay_ms": 650,
+    "pureref_export_timeout_sec": 8,
+    "pureref_export_hard_timeout_sec": 600,
+    "pureref_export_settle_ms": 600,
+    "pureref_process_io_idle_ms": 900,
+    "pureref_process_cpu_idle_ms": 1500,
+    "pureref_cpu_activity_threshold_ms": 1.0,
+    "pureref_dialog_close_grace_ms": 350,
+    "pureref_single_file_confirm_ms": 5000,
+    "pureref_multi_file_confirm_ms": 900,
+    "pureref_capture_base": "",
+    "batch_preload_workers": 2,
+    "batch_cache_stale_hours": 24,
+    "history_retention_days": 30,
+    "history_view_mode": "standard",
+    "storage_root": "",
+    "startup": True,
+    "notify_success": True,
+    "png_compress_level": 6
+}
+
+if os.name != "nt":
+    raise SystemExit("ImagePasteTool V2 supports Windows only.")
+
+# Portable application directory.
+# In a PyInstaller one-file EXE, sys.executable is the real EXE path, so the
+# config remains beside ImagePasteTool.exe rather than inside PyInstaller's
+# temporary extraction folder.
+APP_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+
+APPDATA = Path(os.getenv("APPDATA") or Path.home())
+
+# V2.3.5 portable config: put config beside the EXE/script.
+# This lets the whole tool live on D:/E:/a portable drive without requiring
+# write permission to C:\Users\...\AppData.
+CONFIG_PATH = APP_DIR / "config.json"
+
+# Read-only migration source only. We never need to write here in portable mode.
+LEGACY_CONFIG_PATH = APPDATA / APP_NAME / "config.json"
+
+# These are assigned after config is loaded by apply_storage_paths().
+DATA_DIR = APP_DIR / "ImagePasteTool_Data"
+LOG_PATH = DATA_DIR / "activity.log"
+
+# --- Win32 constants ----------------------------------------------------------
+
+user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+
+CF_DIB = 8
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
+
+WM_HOTKEY = 0x0312
+WM_QUIT = 0x0012
+WM_RELOAD_HOTKEY = 0x8001
+
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_WIN = 0x0008
+MOD_NOREPEAT = 0x4000
+
+HOTKEY_ID = 0xA112
+PUREREF_HOTKEY_ID = 0xA113
+ONE_BY_ONE_HOTKEY_ID = 0xA114
+HISTORY_HOTKEY_ID = 0xA115
+
+VK_CONTROL = 0x11
+VK_SHIFT = 0x10
+VK_MENU = 0x12
+VK_LWIN = 0x5B
+VK_RWIN = 0x5C
+VK_V = 0x56
+VK_I = 0x49
+KEYEVENTF_KEYUP = 0x0002
+
+# Clipboard
+user32.OpenClipboard.argtypes = [wintypes.HWND]
+user32.OpenClipboard.restype = wintypes.BOOL
+user32.CloseClipboard.argtypes = []
+user32.CloseClipboard.restype = wintypes.BOOL
+user32.EmptyClipboard.argtypes = []
+user32.EmptyClipboard.restype = wintypes.BOOL
+user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+user32.SetClipboardData.restype = wintypes.HANDLE
+user32.GetClipboardData.argtypes = [wintypes.UINT]
+user32.GetClipboardData.restype = wintypes.HANDLE
+user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
+user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+user32.RegisterClipboardFormatW.restype = wintypes.UINT
+
+kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+kernel32.GlobalAlloc.restype = wintypes.HANDLE
+kernel32.GlobalLock.argtypes = [wintypes.HANDLE]
+kernel32.GlobalLock.restype = wintypes.LPVOID
+kernel32.GlobalUnlock.argtypes = [wintypes.HANDLE]
+kernel32.GlobalUnlock.restype = wintypes.BOOL
+kernel32.GlobalFree.argtypes = [wintypes.HANDLE]
+kernel32.GlobalFree.restype = wintypes.HANDLE
+
+# Hotkey
+user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+user32.RegisterHotKey.restype = wintypes.BOOL
+user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.UnregisterHotKey.restype = wintypes.BOOL
+user32.GetMessageW.argtypes = [
+    ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT
+]
+user32.GetMessageW.restype = wintypes.BOOL
+user32.PostThreadMessageW.argtypes = [
+    wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+]
+user32.PostThreadMessageW.restype = wintypes.BOOL
+kernel32.GetCurrentThreadId.argtypes = []
+kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+user32.GetForegroundWindow.argtypes = []
+user32.GetForegroundWindow.restype = wintypes.HWND
+user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+user32.GetWindowTextLengthW.restype = ctypes.c_int
+user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetWindowTextW.restype = ctypes.c_int
+user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+user32.SetForegroundWindow.restype = wintypes.BOOL
+kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.QueryFullProcessImageNameW.argtypes = [
+    wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
+]
+kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+kernel32.CloseHandle.restype = wintypes.BOOL
+
+class IO_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_ulonglong),
+        ("WriteOperationCount", ctypes.c_ulonglong),
+        ("OtherOperationCount", ctypes.c_ulonglong),
+        ("ReadTransferCount", ctypes.c_ulonglong),
+        ("WriteTransferCount", ctypes.c_ulonglong),
+        ("OtherTransferCount", ctypes.c_ulonglong),
+    ]
+
+kernel32.GetProcessIoCounters.argtypes = [
+    wintypes.HANDLE, ctypes.POINTER(IO_COUNTERS)
+]
+kernel32.GetProcessIoCounters.restype = wintypes.BOOL
+
+class PROCESS_FILETIME(ctypes.Structure):
+    _fields_ = [
+        ("dwLowDateTime", wintypes.DWORD),
+        ("dwHighDateTime", wintypes.DWORD),
+    ]
+
+kernel32.GetProcessTimes.argtypes = [
+    wintypes.HANDLE,
+    ctypes.POINTER(PROCESS_FILETIME),
+    ctypes.POINTER(PROCESS_FILETIME),
+    ctypes.POINTER(PROCESS_FILETIME),
+    ctypes.POINTER(PROCESS_FILETIME),
+]
+kernel32.GetProcessTimes.restype = wintypes.BOOL
+
+user32.GetClipboardSequenceNumber.argtypes = []
+user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
+user32.GetClipboardOwner.argtypes = []
+user32.GetClipboardOwner.restype = wintypes.HWND
+
+user32.GetWindowThreadProcessId.argtypes = [
+    wintypes.HWND, ctypes.POINTER(wintypes.DWORD)
+]
+user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+user32.IsWindowVisible.argtypes = [wintypes.HWND]
+user32.IsWindowVisible.restype = wintypes.BOOL
+user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+user32.GetWindowTextLengthW.restype = ctypes.c_int
+user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetWindowTextW.restype = ctypes.c_int
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+user32.GetWindowRect.restype = wintypes.BOOL
+user32.EnumWindows.argtypes = [ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM), wintypes.LPARAM]
+user32.EnumWindows.restype = wintypes.BOOL
+
+# Overlay window helpers
+GWL_EXSTYLE = -20
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_NOACTIVATE = 0x08000000
+SW_SHOWNOACTIVATE = 4
+HWND_TOPMOST = -1
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
+
+try:
+    _GetWindowLong = user32.GetWindowLongPtrW
+    _SetWindowLong = user32.SetWindowLongPtrW
+except AttributeError:
+    _GetWindowLong = user32.GetWindowLongW
+    _SetWindowLong = user32.SetWindowLongW
+
+_GetWindowLong.argtypes = [wintypes.HWND, ctypes.c_int]
+_GetWindowLong.restype = ctypes.c_ssize_t
+_SetWindowLong.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+_SetWindowLong.restype = ctypes.c_ssize_t
+user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.ShowWindow.restype = wintypes.BOOL
+user32.SetWindowPos.argtypes = [
+    wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+    ctypes.c_int, ctypes.c_int, wintypes.UINT
+]
+user32.SetWindowPos.restype = wintypes.BOOL
+
+# Keys
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+user32.GetAsyncKeyState.restype = wintypes.SHORT
+user32.keybd_event.argtypes = [
+    ctypes.c_ubyte, ctypes.c_ubyte, wintypes.DWORD, ctypes.c_size_t
+]
+user32.keybd_event.restype = None
+
+PNG_FORMAT = user32.RegisterClipboardFormatW("PNG")
+
+# --- Globals ------------------------------------------------------------------
+
+CONFIG_LOCK = threading.RLock()
+WORK_LOCK = threading.Lock()
+UI_QUEUE = queue.Queue()
+
+tray_icon = None
+root_tk = None
+settings_window = None
+hotkey_thread_id = None
+
+# One-by-one batch state.
+# After the tool writes one image back to the clipboard, the original CF_HDROP
+# file list is gone. We therefore remember the copied file batch here.
+# Clipboard sequence number is used to detect a NEW Ctrl+C from the user.
+BATCH_LOCK = threading.RLock()
+BATCH_QUEUE = []
+BATCH_TOTAL = 0
+BATCH_DONE = 0
+BATCH_LAST_OWN_SEQ = None
+LAST_COMPLETED_ONE_BY_ONE_SEQ = None
+BATCH_SOURCE = None
+BATCH_TEMP_DIR = None
+BATCH_HISTORY_ID = None
+BATCH_COPY_GENERATION = 0
+
+PUREREF_CAPTURE_LOCK = threading.Lock()
+
+# Portable storage paths. Actual values are assigned after CONFIG is loaded.
+PUREREF_TEMP_ROOT = DATA_DIR / "PureRefCapture"
+BATCH_CACHE_ROOT = DATA_DIR / "BatchCache"
+HISTORY_ROOT = DATA_DIR / "History"
+HISTORY_LOCK = threading.RLock()
+
+# Clipboard history monitor.
+# The monitor records EXTERNAL image clipboard changes (Ctrl+C / Copy Image).
+# Clipboard changes created by ImagePasteTool itself are marked and ignored.
+CLIPBOARD_MONITOR_LOCK = threading.RLock()
+TOOL_CLIPBOARD_WRITE_DEPTH = 0
+LAST_TOOL_CLIPBOARD_SEQ = None
+LAST_HISTORY_CAPTURE_SEQ = None
+
+# Only a REAL external clipboard change increments this counter.
+# PureRef's own internal clipboard changes during capture do not.
+EXTERNAL_COPY_GENERATION = 0
+
+# A PureRef capture session temporarily owns clipboard interpretation.
+PURE_REF_SESSION_LOCK = threading.RLock()
+PURE_REF_CAPTURE_ACTIVE = False
+PURE_REF_ACTIVE_PID = None
+PURE_REF_CLIPBOARD_IGNORE_UNTIL = 0.0
+
+counter_overlay = None
+progress_overlay = None
+history_window = None
+
+# --- Config -------------------------------------------------------------------
+
+def normalize_hotkey(text):
+    text = str(text).upper().replace(" ", "")
+    aliases = {"CONTROL": "CTRL", "WINDOWS": "WIN"}
+    parts = [aliases.get(x, x) for x in text.split("+") if x]
+    order = ["CTRL", "ALT", "SHIFT", "WIN"]
+    mods = [x for x in order if x in parts]
+    keys = [x for x in parts if x not in order]
+    key = keys[-1] if keys else "V"
+    return "+".join(mods + [key])
+
+def parse_hotkey(text):
+    text = normalize_hotkey(text)
+    parts = [x for x in text.split("+") if x]
+    modifiers = MOD_NOREPEAT
+    vk = None
+
