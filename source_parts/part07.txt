@@ -1,0 +1,402 @@
+    clean.pop("_dir", None)
+    temp.write_text(
+        json.dumps(clean, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+    temp.replace(path)
+
+
+def _new_history_session(source, title=""):
+    created = time.time()
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(created))
+    session_id = f"{stamp}_{uuid.uuid4().hex[:7]}"
+    session_dir = HISTORY_ROOT / session_id
+    session_dir.mkdir(parents=True, exist_ok=False)
+
+    meta = {
+        "version": 1,
+        "id": session_id,
+        "created_at": created,
+        "updated_at": created,
+        "source": str(source or "clipboard"),
+        "title": str(title or ""),
+        "items": [],
+    }
+    _write_history_meta(session_dir, meta)
+    return session_id
+
+
+def _history_make_thumb(image_path, thumb_path):
+    """Small persistent thumbnail so opening history never decodes huge CG PNGs."""
+    try:
+        with Image.open(image_path) as src:
+            src = normalize_image(src)
+            src.thumbnail((150, 112), Image.Resampling.LANCZOS)
+
+            if src.mode == "RGBA":
+                bg = Image.new("RGB", src.size, (245, 245, 245))
+                bg.paste(src, mask=src.getchannel("A"))
+                thumb = bg
+            else:
+                thumb = src.convert("RGB")
+
+            thumb.save(thumb_path, "JPEG", quality=82, optimize=True)
+        return True
+    except Exception as e:
+        log(f"历史缩略图生成失败：{image_path} | {e}")
+        return False
+
+
+def history_append_image(
+    session_id,
+    *,
+    source,
+    label="",
+    png_bytes=None,
+    source_path=None,
+):
+    """Append one copied/captured image to one history group.
+
+    Returns the session id. If session_id is None a new group is created.
+    History replay (source == history) is deliberately not recorded again.
+    """
+    if str(source) == "history":
+        return session_id
+
+    with HISTORY_LOCK:
+        if not session_id:
+            session_id = _new_history_session(source)
+
+        session_dir = HISTORY_ROOT / session_id
+        meta = _read_history_meta(session_dir)
+        if not meta:
+            session_id = _new_history_session(source)
+            session_dir = HISTORY_ROOT / session_id
+            meta = _read_history_meta(session_dir)
+
+        index = len(meta["items"]) + 1
+
+        if source_path:
+            suffix = Path(str(source_path)).suffix.lower()
+            if suffix not in SUPPORTED_EXTS:
+                suffix = ".png"
+        else:
+            suffix = ".png"
+
+        filename = f"{index:04d}{suffix}"
+        thumbname = f"{index:04d}_thumb.jpg"
+        dest = session_dir / filename
+        thumb = session_dir / thumbname
+
+        if source_path:
+            src_path = Path(str(source_path))
+            try:
+                # Very fast when source/history are on the same NTFS volume.
+                os.link(src_path, dest)
+            except Exception:
+                shutil.copy2(str(src_path), dest)
+        elif png_bytes is not None:
+            dest.write_bytes(png_bytes)
+        else:
+            raise ValueError("history image requires png_bytes or source_path")
+
+        _history_make_thumb(dest, thumb)
+
+        pasted_at = time.time()
+        item = {
+            "index": index,
+            "file": filename,
+            "thumb": thumbname if thumb.exists() else filename,
+            "label": str(label or ""),
+            "pasted_at": pasted_at,
+        }
+        meta["items"].append(item)
+        meta["updated_at"] = pasted_at
+        _write_history_meta(session_dir, meta)
+        return session_id
+
+
+
+def _capture_clipboard_source_to_history(source, seq):
+    """Record one external clipboard COPY as one history group."""
+    global LAST_HISTORY_CAPTURE_SEQ
+
+    if source["kind"] == "files":
+        paths = source["paths"]
+        if not paths:
+            return False
+
+        session_id = None
+        for path in paths:
+            session_id = history_append_image(
+                session_id,
+                source="clipboard",
+                label=Path(path).name,
+                source_path=path
+            )
+
+        LAST_HISTORY_CAPTURE_SEQ = int(seq)
+        log(f"历史捕获 Ctrl+C：{len(paths)} 张图片文件")
+        UI_QUEUE.put(("history_changed", None))
+        return True
+
+    if source["kind"] == "image":
+        img = normalize_image(source["image"])
+        try:
+            png = image_to_png_bytes(img, 6)
+            history_append_image(
+                None,
+                source="image",
+                label="复制的图像",
+                png_bytes=png
+            )
+        finally:
+            try:
+                img.close()
+            except Exception:
+                pass
+
+        LAST_HISTORY_CAPTURE_SEQ = int(seq)
+        log("历史捕获 Ctrl+C：1 张剪贴板图像")
+        UI_QUEUE.put(("history_changed", None))
+        return True
+
+    return False
+
+
+def clipboard_history_monitor_loop():
+    """Capture real external Ctrl+C image history.
+
+    The external-copy generation is also the authoritative invalidation signal
+    for remembered batches.
+
+    PureRef's internal clipboard changes are ignored during its export session,
+    so they can never collapse a valid multi-image PureRef batch to one bitmap.
+    """
+    global LAST_HISTORY_CAPTURE_SEQ
+
+    last_seen = clipboard_seq()
+
+    while True:
+        try:
+            time.sleep(0.10)
+            seq = clipboard_seq()
+
+            if seq == last_seen:
+                continue
+            last_seen = seq
+
+            # PureRef capture owns clipboard interpretation for the duration of
+            # the session. Keep baseline moving, but do nothing else.
+            if _should_ignore_clipboard_change_for_pureref():
+                log(
+                    "忽略 PureRef 导出期间/之后的内部剪贴板变化："
+                    f"seq={seq}, owner_pid={clipboard_owner_pid()}"
+                )
+                continue
+
+            if _clipboard_change_is_tool_owned(seq):
+                continue
+
+            # Let the source application finish publishing clipboard formats.
+            time.sleep(0.08)
+
+            settled_seq = clipboard_seq()
+            if settled_seq != seq:
+                last_seen = settled_seq
+
+                if _should_ignore_clipboard_change_for_pureref():
+                    continue
+
+                if _clipboard_change_is_tool_owned(settled_seq):
+                    continue
+
+                seq = settled_seq
+
+            # This is now a real external clipboard replacement.
+            generation = _increment_external_copy_generation()
+            owner_pid = clipboard_owner_pid()
+            log(
+                "检测到外部剪贴板复制："
+                f"generation={generation}, seq={seq}, owner_pid={owner_pid}"
+            )
+
+            source = read_clipboard_source()
+
+            if (
+                LAST_HISTORY_CAPTURE_SEQ is not None
+                and int(seq) == int(LAST_HISTORY_CAPTURE_SEQ)
+            ):
+                continue
+
+            _capture_clipboard_source_to_history(source, seq)
+
+        except Exception as e:
+            log(f"历史剪贴板监控错误：{e}")
+            time.sleep(0.4)
+
+
+
+
+
+def list_history_sessions():
+    """Read history for UI only. No retention cleanup happens here."""
+    sessions = []
+    try:
+        dirs = [p for p in HISTORY_ROOT.iterdir() if p.is_dir()]
+    except Exception:
+        dirs = []
+
+    for d in dirs:
+        meta = _read_history_meta(d)
+        if not meta:
+            continue
+        items = []
+        for item in meta.get("items", []):
+            file_path = d / item.get("file", "")
+            if not file_path.exists():
+                continue
+            clean = dict(item)
+            clean["_file_path"] = str(file_path)
+            thumb_path = d / item.get("thumb", "")
+            clean["_thumb_path"] = str(
+                thumb_path if thumb_path.exists() else file_path
+            )
+            items.append(clean)
+
+        if not items:
+            continue
+        meta["items"] = items
+        sessions.append(meta)
+
+    sessions.sort(
+        key=lambda x: float(x.get("updated_at", x.get("created_at", 0))),
+        reverse=True
+    )
+    return sessions
+
+
+def cleanup_history_on_startup():
+    """Retention cleanup runs ONCE when the application starts.
+
+    It is intentionally not called by the history window, timers, paste
+    operations, or settings changes.
+    """
+    with CONFIG_LOCK:
+        days = int(CONFIG.get("history_retention_days", 30))
+
+    if days == 0:
+        log("历史清理：永久保留，本次启动不删除历史")
+        return
+
+    cutoff = time.time() - days * 86400
+    removed = 0
+
+    try:
+        dirs = [p for p in HISTORY_ROOT.iterdir() if p.is_dir()]
+    except Exception:
+        dirs = []
+
+    for d in dirs:
+        try:
+            meta = _read_history_meta(d)
+            stamp = (
+                float(meta.get("updated_at", meta.get("created_at", 0)))
+                if meta else float(d.stat().st_mtime)
+            )
+            if stamp < cutoff:
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
+        except Exception:
+            continue
+
+    log(f"历史清理：保留 {days} 天；启动时删除 {removed} 个过期批次")
+
+
+def history_batch_source(batch_owned=False):
+    if not batch_owned:
+        return "files"
+    with BATCH_LOCK:
+        return BATCH_SOURCE or "clipboard"
+
+
+def load_history_batch(paths):
+    """Load selected history item(s) as a remembered batch.
+
+    The history itself is not duplicated when replayed.
+    """
+    valid = [str(p) for p in paths if Path(p).is_file()]
+    if not valid:
+        notify("历史图片文件不存在")
+        return False
+
+    clear_batch_queue(hide_counter=True, delete_temp=True)
+    start_batch_queue(
+        valid,
+        source="history",
+        temp_dir=None,
+        initial_seq=clipboard_seq()
+    )
+    notify(
+        f"历史已载入 {len(valid)} 张；"
+        f"批量用 {CONFIG['hotkey']}，逐张用 {CONFIG['one_by_one_hotkey']}"
+    )
+    return True
+
+
+# --- Processing ---------------------------------------------------------------
+
+def _finish_prepared_paste(info, label, source_kind, source_file_bytes=None):
+    """Write a prepared image to clipboard, paste it, and log it."""
+    write_image_clipboard(info["image"], info["png"])
+
+    with CONFIG_LOCK:
+        auto_paste = CONFIG["auto_paste"]
+
+    if auto_paste:
+        wait_hotkey_release()
+        time.sleep(0.035)
+        send_ctrl_v()
+
+    before = mb(info["before_png_bytes"])
+    after = mb(info["after_png_bytes"])
+    px0 = f"{info['original_px'][0]}×{info['original_px'][1]}"
+    px1 = f"{info['output_px'][0]}×{info['output_px'][1]}"
+
+    if info["resized"]:
+        action = f"已压缩 {before:.1f} → {after:.1f} MB，{px0} → {px1}"
+    else:
+        action = f"无需压缩，剪贴板图像约 {after:.1f} MB，{px1}"
+
+    if source_file_bytes is not None:
+        action += f"；源文件 {mb(source_file_bytes):.1f} MB"
+
+    log(f"{source_kind} | {label} | {action}")
+    return action
+
+
+def process_one_image(img, label, source_kind, source_file_bytes=None):
+    info = prepare_image(img)
+    write_image_clipboard(info["image"], info["png"])
+
+    with CONFIG_LOCK:
+        auto_paste = CONFIG["auto_paste"]
+
+    if auto_paste:
+        wait_hotkey_release()
+        time.sleep(0.07)
+        send_ctrl_v()
+
+    before = mb(info["before_png_bytes"])
+    after = mb(info["after_png_bytes"])
+    px0 = f"{info['original_px'][0]}×{info['original_px'][1]}"
+    px1 = f"{info['output_px'][0]}×{info['output_px'][1]}"
+
+    if info["resized"]:
+        action = f"已压缩 {before:.1f} → {after:.1f} MB，{px0} → {px1}"
+    else:
+        action = f"无需压缩，剪贴板图像约 {after:.1f} MB，{px1}"
+
+    if source_file_bytes is not None:
+        action += f"；源文件 {mb(source_file_bytes):.1f} MB"
+
