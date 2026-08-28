@@ -15,6 +15,14 @@ if errorlevel 1 (
 py -m pip install --upgrade pip
 py -m pip install -r requirements.txt pyinstaller
 
+py tools\assemble_source.py
+if errorlevel 1 (
+  echo.
+  echo [ERROR] Source assembly or syntax validation failed.
+  pause
+  exit /b 1
+)
+
 py -m PyInstaller ^
   --noconfirm ^
   --clean ^
