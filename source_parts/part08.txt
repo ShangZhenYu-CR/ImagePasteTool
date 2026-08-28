@@ -1,0 +1,365 @@
+    log(f"{source_kind} | {label} | {action}")
+    return action, info
+
+
+def _preload_batch_item(index, path, cache_dir):
+    """Decode/compress ONE image, then immediately spool the prepared PNG to disk.
+
+    Memory use is therefore bounded by the number of worker threads rather than
+    the total number of images in the copied batch.
+    """
+    p = Path(path)
+
+    with Image.open(p) as im:
+        img = normalize_image(im)
+
+    info = prepare_image(img)
+
+    cache_path = Path(cache_dir) / f"{index + 1:05d}.png"
+    with cache_path.open("wb") as f:
+        f.write(info["png"])
+
+    # IMPORTANT: do not return PIL image or PNG bytes.
+    # They are released when this function exits.
+    return {
+        "index": index,
+        "path": str(p),
+        "name": p.name,
+        "source_file_bytes": p.stat().st_size,
+        "cache_path": str(cache_path),
+        "before_png_bytes": int(info["before_png_bytes"]),
+        "after_png_bytes": int(info["after_png_bytes"]),
+        "original_px": tuple(info["original_px"]),
+        "output_px": tuple(info["output_px"]),
+        "resized": bool(info["resized"]),
+        "iterations": int(info["iterations"]),
+        "limit_mb": int(info["limit_mb"]),
+        "compression_enabled": bool(info["compression_enabled"]),
+    }
+
+
+def _preload_batch(paths):
+    """Prepare the entire batch to LOCAL DISK before the first paste.
+
+    Only `batch_preload_workers` decoded images are resident at once.
+    Prepared PNGs are written to:
+        %LOCALAPPDATA%\\ImagePasteTool\\BatchCache\\<timestamp>_<id>\\
+
+    The cache directory is deleted automatically after paste completes.
+    """
+    total = len(paths)
+    if not total:
+        return [], None
+
+    cache_dir = make_batch_cache_dir()
+
+    with CONFIG_LOCK:
+        workers = int(CONFIG.get("batch_preload_workers", 2))
+    workers = max(1, min(workers, total, 4))
+
+    log(f"批量预处理开始：{total} 张，{workers} 线程；缓存：{cache_dir}")
+    UI_QUEUE.put(("status", f"正在预处理批量图片 0/{total}"))
+    show_batch_progress("预处理", 0, total, "准备本地缓存…")
+
+    results = [None] * total
+    done = 0
+
+    try:
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="ImgDiskCache"
+        ) as pool:
+            futures = {
+                pool.submit(_preload_batch_item, i, path, cache_dir): i
+                for i, path in enumerate(paths)
+            }
+
+            for fut in as_completed(futures):
+                i = futures[fut]
+                try:
+                    item = fut.result()
+                    results[i] = item
+                except Exception as e:
+                    raise RuntimeError(
+                        f"预处理失败：{Path(paths[i]).name} | {e}"
+                    ) from e
+
+                done += 1
+                detail = Path(paths[i]).name
+                UI_QUEUE.put(("status", f"正在预处理批量图片 {done}/{total}"))
+                show_batch_progress("预处理", done, total, detail)
+
+        log(f"批量预处理完成：{total} 张；磁盘缓存：{cache_dir}")
+        UI_QUEUE.put(("status", f"预处理完成，开始粘贴 0/{total}"))
+        show_batch_progress("准备粘贴", 0, total, "处理结果已写入本地缓存")
+        return results, cache_dir
+
+    except Exception:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        hide_batch_progress()
+        raise
+
+
+def _load_cached_prepared_info(item):
+    """Load only the CURRENT cached image into RAM for clipboard transfer."""
+    cache_path = Path(item["cache_path"])
+    png_bytes = cache_path.read_bytes()
+
+    with Image.open(cache_path) as im:
+        img = normalize_image(im)
+
+    return {
+        "image": img,
+        "png": png_bytes,
+        "before_png_bytes": item["before_png_bytes"],
+        "after_png_bytes": item["after_png_bytes"],
+        "original_px": item["original_px"],
+        "output_px": item["output_px"],
+        "resized": item["resized"],
+        "iterations": item["iterations"],
+        "limit_mb": item["limit_mb"],
+        "compression_enabled": item["compression_enabled"],
+    }
+
+
+
+def _paste_all_files_preload(paths, notify_success, batch_owned=False):
+    """Disk-backed batch pipeline.
+
+    Phase 1: prepare every image to local disk.
+    Phase 2: load only one cached PNG at a time and paste at a stable cadence.
+
+    This avoids RAM growing with the number of images in the batch.
+    """
+    if not batch_owned:
+        clear_batch_queue(hide_counter=True)
+
+    total = len(paths)
+    if not total:
+        return
+
+    cache_dir = None
+
+    try:
+        prepared, cache_dir = _preload_batch(paths)
+    except Exception as e:
+        msg = str(e)
+        log(msg)
+        notify(msg)
+        hide_batch_progress()
+        if batch_owned:
+            clear_batch_queue(hide_counter=True)
+        return
+
+    with CONFIG_LOCK:
+        min_interval = CONFIG.get("batch_paste_delay_ms", 650) / 1000.0
+
+    last_action = ""
+    next_paste_deadline = time.perf_counter()
+
+    try:
+        show_batch_progress("粘贴", 0, total, "开始连续粘贴")
+
+        for idx, item in enumerate(prepared, 1):
+            try:
+                now = time.perf_counter()
+                if now < next_paste_deadline:
+                    time.sleep(next_paste_deadline - now)
+
+                paste_started = time.perf_counter()
+
+                # Only CURRENT image is loaded into memory here.
+                info = _load_cached_prepared_info(item)
+
+                last_action = _finish_prepared_paste(
+                    info,
+                    item["name"],
+                    "图片文件 / 全部粘贴",
+                    item["source_file_bytes"]
+                )
+
+                # Explicitly drop the large references before waiting for next item.
+                try:
+                    info["image"].close()
+                except Exception:
+                    pass
+                del info
+
+                UI_QUEUE.put(("status", f"正在批量粘贴 {idx}/{total}"))
+                show_batch_progress("粘贴", idx, total, item["name"])
+
+                next_paste_deadline = paste_started + min_interval
+
+            except Exception as e:
+                msg = f"粘贴失败：{item['name']} | {e}"
+                log(msg)
+                notify(msg)
+                show_batch_progress("失败", idx - 1, total, item["name"], completed=True)
+                if batch_owned:
+                    clear_batch_queue(hide_counter=True)
+                return
+
+        UI_QUEUE.put(("status", f"批量粘贴完成 {total}/{total}"))
+        show_batch_progress(
+            "完成", total, total,
+            f"本批 {total} 张已完成",
+            completed=True
+        )
+
+        if notify_success:
+            if total == 1:
+                notify(last_action)
+            else:
+                notify(f"已一次性完成 {total} 张图片的粘贴")
+
+        if batch_owned:
+            clear_batch_queue(hide_counter=True)
+
+    finally:
+        # Prepared images live on disk only during the batch.
+        if cache_dir:
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            log(f"批量磁盘缓存已清理：{cache_dir}")
+
+
+
+
+def _paste_all_files_streaming(paths, notify_success, batch_owned=False):
+    """边处理边粘贴，同时继续使用硬盘缓存。
+
+    预处理线程把每张最终 PNG 写入 BatchCache。
+    第 1 张完成后即可开始粘贴；后台继续处理后面的图片。
+    因为最终结果仍写到磁盘，所以不会把整个批次长期堆在 RAM。
+    """
+    if not batch_owned:
+        clear_batch_queue(hide_counter=True)
+
+    total = len(paths)
+    if not total:
+        return
+
+    cache_dir = make_batch_cache_dir()
+
+    with CONFIG_LOCK:
+        workers = int(CONFIG.get("batch_preload_workers", 2))
+        min_interval = CONFIG.get("batch_paste_delay_ms", 650) / 1000.0
+
+    workers = max(1, min(workers, total, 4))
+
+    progress_state = {
+        "processed": 0,
+        "pasted": 0,
+    }
+    progress_lock = threading.Lock()
+    futures = []
+    last_action = ""
+    next_paste_deadline = time.perf_counter()
+
+    log(
+        f"边处理边粘贴开始：{total} 张，{workers} 线程；缓存：{cache_dir}"
+    )
+    show_batch_progress(
+        "边处理边粘贴",
+        0, total,
+        f"已处理 0/{total} · 已粘贴 0/{total}"
+    )
+
+    def prepared_callback(fut):
+        # Callback runs in worker context; only update lightweight counters/UI.
+        with progress_lock:
+            progress_state["processed"] += 1
+            processed = progress_state["processed"]
+            pasted = progress_state["pasted"]
+
+        show_batch_progress(
+            "边处理边粘贴",
+            pasted, total,
+            f"已处理 {processed}/{total} · 已粘贴 {pasted}/{total}"
+        )
+
+    try:
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="ImgStreamCache"
+        ) as pool:
+            for i, path in enumerate(paths):
+                fut = pool.submit(
+                    _preload_batch_item, i, path, cache_dir
+                )
+                fut.add_done_callback(prepared_callback)
+                futures.append(fut)
+
+            # Preserve the original file order while workers process ahead.
+            for idx, fut in enumerate(futures, 1):
+                if not fut.done():
+                    with progress_lock:
+                        processed = progress_state["processed"]
+                        pasted = progress_state["pasted"]
+                    show_batch_progress(
+                        "边处理边粘贴",
+                        pasted, total,
+                        f"已处理 {processed}/{total} · "
+                        f"等待第 {idx}/{total} 张处理…"
+                    )
+
+                try:
+                    item = fut.result()
+                except Exception as e:
+                    name = Path(paths[idx - 1]).name
+                    raise RuntimeError(
+                        f"预处理失败：{name} | {e}"
+                    ) from e
+
+                now = time.perf_counter()
+                if now < next_paste_deadline:
+                    time.sleep(next_paste_deadline - now)
+
+                paste_started = time.perf_counter()
+                info = _load_cached_prepared_info(item)
+
+                try:
+                    last_action = _finish_prepared_paste(
+                        info,
+                        item["name"],
+                        "图片文件 / 边处理边粘贴",
+                        item["source_file_bytes"]
+                    )
+                finally:
+                    try:
+                        info["image"].close()
+                    except Exception:
+                        pass
+                    del info
+
+                with progress_lock:
+                    progress_state["pasted"] += 1
+                    pasted = progress_state["pasted"]
+                    processed = progress_state["processed"]
+
+                UI_QUEUE.put((
+                    "status",
+                    f"边处理边粘贴 {pasted}/{total}"
+                ))
+                show_batch_progress(
+                    "边处理边粘贴",
+                    pasted, total,
+                    f"已处理 {processed}/{total} · 已粘贴 {pasted}/{total}"
+                )
+
+                next_paste_deadline = paste_started + min_interval
+
+        show_batch_progress(
+            "完成",
+            total, total,
+            f"已处理 {total}/{total} · 已粘贴 {total}/{total}",
+            completed=True
+        )
+        UI_QUEUE.put(("status", f"批量粘贴完成 {total}/{total}"))
+
+        if notify_success:
+            if total == 1:
+                notify(last_action)
+            else:
+                notify(f"已完成 {total} 张图片")
+
+        if batch_owned:
