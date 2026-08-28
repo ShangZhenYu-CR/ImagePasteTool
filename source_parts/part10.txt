@@ -1,0 +1,325 @@
+                target=capture_pureref_selected_images,
+                daemon=True
+            ).start()
+
+        elif msg.message == WM_HOTKEY and msg.wParam == ONE_BY_ONE_HOTKEY_ID:
+            threading.Thread(
+                target=convert_and_paste_one_by_one,
+                daemon=True
+            ).start()
+
+        elif msg.message == WM_HOTKEY and msg.wParam == HISTORY_HOTKEY_ID:
+            UI_QUEUE.put(("open_history", None))
+
+        elif msg.message == WM_RELOAD_HOTKEY:
+            user32.UnregisterHotKey(None, HOTKEY_ID)
+            user32.UnregisterHotKey(None, PUREREF_HOTKEY_ID)
+            user32.UnregisterHotKey(None, ONE_BY_ONE_HOTKEY_ID)
+            user32.UnregisterHotKey(None, HISTORY_HOTKEY_ID)
+            _registered_hotkey = None
+            _registered_pureref_hotkey = None
+            _registered_one_by_one_hotkey = None
+            _registered_history_hotkey = None
+            register_current_hotkeys()
+
+    user32.UnregisterHotKey(None, HOTKEY_ID)
+    user32.UnregisterHotKey(None, PUREREF_HOTKEY_ID)
+    user32.UnregisterHotKey(None, ONE_BY_ONE_HOTKEY_ID)
+    user32.UnregisterHotKey(None, HISTORY_HOTKEY_ID)
+
+
+def request_hotkey_reload():
+    if hotkey_thread_id:
+        user32.PostThreadMessageW(
+            hotkey_thread_id, WM_RELOAD_HOTKEY, 0, 0
+        )
+
+# --- Tray ---------------------------------------------------------------------
+
+def create_tray_image():
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((9, 12, 55, 57), radius=9, fill=(64, 64, 64, 255))
+    d.rounded_rectangle((20, 5, 44, 20), radius=5, fill=(120, 120, 120, 255))
+    d.rectangle((16, 26, 48, 48), fill=(238, 238, 238, 255))
+    d.polygon([(17, 47), (28, 35), (34, 41), (40, 35), (48, 47)],
+              fill=(105, 105, 105, 255))
+    d.ellipse((38, 29, 43, 34), fill=(105, 105, 105, 255))
+    return img
+
+def tray_set_limit(value):
+    def handler(icon, item):
+        with CONFIG_LOCK:
+            CONFIG["limit_mb"] = value
+        save_config()
+        notify(f"压缩上限已切换为 {value} MB")
+        icon.update_menu()
+        UI_QUEUE.put(("refresh", None))
+    return handler
+
+def tray_toggle_compression(icon, item):
+    with CONFIG_LOCK:
+        CONFIG["compression_enabled"] = not CONFIG["compression_enabled"]
+        state = CONFIG["compression_enabled"]
+    save_config()
+    notify("超限自动压缩：开启" if state else "超限自动压缩：关闭")
+    icon.update_menu()
+    UI_QUEUE.put(("refresh", None))
+
+def tray_toggle_auto_paste(icon, item):
+    with CONFIG_LOCK:
+        CONFIG["auto_paste"] = not CONFIG["auto_paste"]
+        state = CONFIG["auto_paste"]
+    save_config()
+    notify("转换后自动粘贴：开启" if state else "转换后自动粘贴：关闭")
+    icon.update_menu()
+    UI_QUEUE.put(("refresh", None))
+
+def tray_set_batch_mode(value):
+    def handler(icon, item):
+        with CONFIG_LOCK:
+            CONFIG["batch_mode"] = value
+        save_config()
+        clear_batch_queue(hide_counter=True)
+        label = "一次性全粘贴" if value == "all" else "一次粘贴一张"
+        notify(f"批量粘贴模式：{label}")
+        icon.update_menu()
+        UI_QUEUE.put(("refresh", None))
+    return handler
+
+def checked_batch_mode(value):
+    def inner(item):
+        with CONFIG_LOCK:
+            return CONFIG["batch_mode"] == value
+    return inner
+
+def tray_toggle_stream_processing(icon, item):
+    with CONFIG_LOCK:
+        CONFIG["batch_stream_processing"] = not CONFIG[
+            "batch_stream_processing"
+        ]
+        state = CONFIG["batch_stream_processing"]
+    save_config()
+    label = "边处理边粘贴" if state else "全部处理完成后再粘贴"
+    notify(f"批量处理方式：{label}")
+    icon.update_menu()
+    UI_QUEUE.put(("refresh", None))
+
+def checked_stream_processing(item):
+    with CONFIG_LOCK:
+        return CONFIG["batch_stream_processing"]
+
+def open_settings_from_tray(icon=None, item=None):
+    UI_QUEUE.put(("open_settings", None))
+
+def open_history_from_tray(icon=None, item=None):
+    UI_QUEUE.put(("open_history", None))
+
+
+def open_log(icon=None, item=None):
+    try:
+        if not LOG_PATH.exists():
+            LOG_PATH.write_text("", encoding="utf-8")
+        os.startfile(LOG_PATH)
+    except Exception as e:
+        notify(f"无法打开日志：{e}")
+
+def exit_app(icon, item):
+    if hotkey_thread_id:
+        user32.PostThreadMessageW(hotkey_thread_id, WM_QUIT, 0, 0)
+    icon.stop()
+    UI_QUEUE.put(("quit", None))
+
+def checked_limit(v):
+    def inner(item):
+        with CONFIG_LOCK:
+            return CONFIG["limit_mb"] == v
+    return inner
+
+def checked_compression(item):
+    with CONFIG_LOCK:
+        return CONFIG["compression_enabled"]
+
+def checked_auto_paste(item):
+    with CONFIG_LOCK:
+        return CONFIG["auto_paste"]
+
+def tray_loop():
+    global tray_icon
+    menu = pystray.Menu(
+        Item("设置…", open_settings_from_tray, default=True),
+        Item(
+            lambda item: f"历史剪贴板…  {CONFIG['history_hotkey']}",
+            open_history_from_tray
+        ),
+        Item(lambda item: f"PureRef 捕获：{CONFIG['pureref_capture_hotkey']}",
+             lambda icon, item: None, enabled=False),
+        Item(lambda item: f"逐张下一张：{CONFIG['one_by_one_hotkey']}",
+             lambda icon, item: None, enabled=False),
+        pystray.Menu.SEPARATOR,
+        Item("20 MB", tray_set_limit(20), checked=checked_limit(20), radio=True),
+        Item("32 MB", tray_set_limit(32), checked=checked_limit(32), radio=True),
+        Item("超限自动压缩", tray_toggle_compression, checked=checked_compression),
+        Item("转换后自动粘贴", tray_toggle_auto_paste, checked=checked_auto_paste),
+        pystray.Menu.SEPARATOR,
+        Item("批量：一次性全粘贴", tray_set_batch_mode("all"),
+             checked=checked_batch_mode("all"), radio=True),
+        Item("批量：一次粘贴一张", tray_set_batch_mode("one"),
+             checked=checked_batch_mode("one"), radio=True),
+        Item(
+            "批量：边处理边粘贴",
+            tray_toggle_stream_processing,
+            checked=checked_stream_processing
+        ),
+        pystray.Menu.SEPARATOR,
+        Item("查看处理日志", open_log),
+        Item("退出", exit_app)
+    )
+    tray_icon = pystray.Icon(
+        APP_NAME, create_tray_image(), f"{APP_NAME} V{APP_VERSION}", menu
+    )
+    tray_icon.run()
+
+# --- Settings UI --------------------------------------------------------------
+
+class SettingsWindow:
+    def __init__(self, master):
+        self.top = tk.Toplevel(master)
+        self.top.title(f"{APP_NAME} V{APP_VERSION}")
+        self.top.resizable(False, False)
+        self.top.protocol("WM_DELETE_WINDOW", self.top.withdraw)
+
+        self.hotkey_var = tk.StringVar()
+        self.pureref_hotkey_var = tk.StringVar()
+        self.one_hotkey_var = tk.StringVar()
+        self.history_hotkey_var = tk.StringVar()
+        self.storage_root_var = tk.StringVar()
+        self.limit_var = tk.IntVar()
+        self.compression_var = tk.BooleanVar()
+        self.auto_paste_var = tk.BooleanVar()
+        self.batch_mode_var = tk.StringVar()
+        self.stream_batch_var = tk.BooleanVar()
+        self.batch_delay_var = tk.StringVar()
+        self.startup_var = tk.BooleanVar()
+        self.notify_var = tk.BooleanVar()
+        self.history_retention_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="等待操作")
+
+        outer = ttk.Frame(self.top, padding=16)
+        outer.grid(row=0, column=0, sticky="nsew")
+
+        ttk.Label(
+            outer,
+            text="普通图片直接粘贴；PureRef 多选先捕获。历史会自动记录 Ctrl+C 复制的图片。",
+            wraplength=520
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 14))
+
+        ttk.Label(outer, text="普通粘贴快捷键").grid(
+            row=1, column=0, sticky="w", pady=6
+        )
+        ttk.Entry(outer, textvariable=self.hotkey_var, width=24).grid(
+            row=1, column=1, sticky="w", pady=6
+        )
+        ttk.Label(outer, text="默认 ALT+WIN+V").grid(
+            row=1, column=2, sticky="w", padx=(8, 0)
+        )
+
+        ttk.Label(outer, text="PureRef 捕获快捷键").grid(
+            row=2, column=0, sticky="w", pady=6
+        )
+        ttk.Entry(outer, textvariable=self.pureref_hotkey_var, width=24).grid(
+            row=2, column=1, sticky="w", pady=6
+        )
+        ttk.Label(outer, text="默认 ALT+WIN+C").grid(
+            row=2, column=2, sticky="w", padx=(8, 0)
+        )
+
+        ttk.Label(outer, text="逐张粘贴快捷键").grid(
+            row=3, column=0, sticky="w", pady=6
+        )
+        ttk.Entry(outer, textvariable=self.one_hotkey_var, width=24).grid(
+            row=3, column=1, sticky="w", pady=6
+        )
+        ttk.Label(outer, text="默认 CTRL+ALT+WIN+V；显示 当前/总数").grid(
+            row=3, column=2, sticky="w", padx=(8, 0)
+        )
+
+        ttk.Label(outer, text="历史剪贴板快捷键").grid(
+            row=4, column=0, sticky="w", pady=6
+        )
+        ttk.Entry(
+            outer, textvariable=self.history_hotkey_var, width=24
+        ).grid(row=4, column=1, sticky="w", pady=6)
+        ttk.Label(outer, text="默认 CTRL+ALT+WIN+C").grid(
+            row=4, column=2, sticky="w", padx=(8, 0)
+        )
+
+        ttk.Label(outer, text="数据 / 输出根目录").grid(
+            row=5, column=0, sticky="w", pady=6
+        )
+        storage_box = ttk.Frame(outer)
+        storage_box.grid(row=5, column=1, columnspan=2, sticky="ew", pady=6)
+        ttk.Entry(
+            storage_box,
+            textvariable=self.storage_root_var,
+            width=42
+        ).pack(side="left")
+        ttk.Button(
+            storage_box,
+            text="选择…",
+            command=self.choose_storage_root
+        ).pack(side="left", padx=(8, 0))
+        ttk.Label(
+            outer,
+            text="PureRef 输出 / 历史 / 缓存 / 日志；修改后重启生效",
+            wraplength=500
+        ).grid(row=6, column=1, columnspan=2, sticky="w", pady=(0, 4))
+
+        ttk.Label(outer, text="图像大小上限").grid(
+            row=7, column=0, sticky="w", pady=6
+        )
+        limit_box = ttk.Frame(outer)
+        limit_box.grid(row=7, column=1, columnspan=2, sticky="w")
+        ttk.Radiobutton(
+            limit_box, text="20 MB", variable=self.limit_var, value=20
+        ).pack(side="left")
+        ttk.Radiobutton(
+            limit_box, text="32 MB", variable=self.limit_var, value=32
+        ).pack(side="left", padx=(14, 0))
+
+        ttk.Checkbutton(
+            outer,
+            text="仅在超过上限时自动压缩图像",
+            variable=self.compression_var
+        ).grid(row=8, column=0, columnspan=3, sticky="w", pady=6)
+
+        ttk.Checkbutton(
+            outer,
+            text="转换后立即粘贴到当前窗口（关闭后需手动 Ctrl+V）",
+            variable=self.auto_paste_var
+        ).grid(row=11, column=0, columnspan=3, sticky="w", pady=6)
+
+        ttk.Label(outer, text="普通快捷键的批量方式").grid(
+            row=10, column=0, sticky="nw", pady=6
+        )
+        batch_box = ttk.Frame(outer)
+        batch_box.grid(row=10, column=1, columnspan=2, sticky="w")
+        ttk.Radiobutton(
+            batch_box,
+            text="一次性全粘贴",
+            variable=self.batch_mode_var,
+            value="all"
+        ).pack(anchor="w")
+        ttk.Radiobutton(
+            batch_box,
+            text="一次粘贴一张（悬浮计数显示 当前/总数）",
+            variable=self.batch_mode_var,
+            value="one"
+        ).pack(anchor="w", pady=(4, 0))
+
+        ttk.Checkbutton(
+            outer,
+            text="边处理边粘贴（关闭 = 全部处理完成后再开始粘贴）",
+            variable=self.stream_batch_var
+        ).grid(row=11, column=0, columnspan=3, sticky="w", pady=6)
+
