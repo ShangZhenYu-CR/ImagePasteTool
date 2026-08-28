@@ -1,0 +1,15 @@
+# Generated source assembled from source_parts/
+image_paste_v2_3_6.pyw
+
+# PyInstaller output
+build/
+dist/
+*.spec
+
+# User-local portable state
+config.json
+ImagePasteTool_Data/
+
+# Python
+__pycache__/
+*.pyc
