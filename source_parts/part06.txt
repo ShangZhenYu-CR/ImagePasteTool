@@ -1,0 +1,353 @@
+                            export_dialog_seen = True
+                            last_activity = now
+                            continue
+
+                    if not path_set and handle not in clicked_browse:
+                        if _click_button_by_words(
+                            win,
+                            (
+                                'browse',
+                                'choose',
+                                'folder',
+                                'location',
+                                'directory',
+                                '浏览',
+                                '选择',
+                                '文件夹',
+                                '目录',
+                                '位置'
+                            )
+                        ):
+                            clicked_browse.add(handle)
+                            last_activity = now
+                            continue
+
+                    if handle not in clicked_export:
+                        if _click_button_by_words(
+                            win, ('export', '导出')
+                        ):
+                            clicked_export.add(handle)
+                            export_command_driven = True
+                            export_dialog_seen = True
+                            last_activity = now
+
+        # ------------------------------------------------------------
+        # F. Inactivity timeout.
+        # ------------------------------------------------------------
+        effective_inactivity_timeout = inactivity_timeout
+        if (
+            files
+            and len(files) == 1
+            and stable_since is not None
+            and export_command_driven
+        ):
+            effective_inactivity_timeout = max(
+                inactivity_timeout,
+                single_file_confirm_sec + 2.0
+            )
+
+        if now - last_activity >= effective_inactivity_timeout:
+            files = _list_exported_images(folder)
+
+            if export_command_driven:
+                current_dialog = bool(
+                    _find_pureref_export_dialog_win32(pid, main_hwnd)
+                )
+                current_io = _pureref_io_snapshot(pid)
+                io_still_busy = (
+                    current_io is not None
+                    and now - last_io_activity < io_idle_sec
+                )
+                current_cpu = _pureref_cpu_snapshot(pid)
+                cpu_still_busy = (
+                    current_cpu is not None
+                    and now - last_cpu_activity < cpu_idle_sec
+                )
+
+                if current_dialog:
+                    return [], (
+                        f"PureRef 导出窗口连续 {effective_inactivity_timeout:g} 秒"
+                        f"没有进展；当前检测 {len(files)} 张。"
+                    )
+
+                if io_still_busy or cpu_still_busy:
+                    # PureRef is still physically writing OR still computing
+                    # the next large image. Do not call a long export "stuck".
+                    last_activity = now
+                    continue
+
+                if files:
+                    return [], (
+                        f"PureRef 导出流程已停止变化 {effective_inactivity_timeout:g} 秒；"
+                        f"当前检测 {len(files)} 张，"
+                        f"但没有同时满足完成条件。"
+                    )
+
+                return [], (
+                    f"PureRef 已提交导出，但连续 {effective_inactivity_timeout:g} 秒"
+                    "没有生成图片文件。"
+                )
+
+            return [], (
+                f"等待 PureRef 导出流程超过 {effective_inactivity_timeout:g} 秒。"
+            )
+
+        time.sleep(0.012)
+
+
+
+def capture_pureref_selected_images():
+    if not PUREREF_CAPTURE_LOCK.acquire(blocking=False):
+        return
+
+    session_pid = None
+    try:
+        info = foreground_pureref()
+        if not info:
+            msg = '请先切到 PureRef，选中一张或多张图片后再按 PureRef 捕获快捷键'
+            log('PureRef 捕获失败：当前前台窗口不是 PureRef')
+            show_batch_progress(
+                "PureRef 捕获失败", 0, 0, msg, completed=True
+            )
+            return
+
+        session_pid = info["pid"]
+        # From this moment until after the PureRef batch queue is established,
+        # ordinary clipboard-history interpretation is suspended.
+        _set_pureref_capture_session(
+            True,
+            pid=session_pid
+        )
+
+        clear_batch_queue(hide_counter=True)
+        # Fixed BASE path + a fresh second-resolution folder for every capture.
+        # Example:
+        # %LOCALAPPDATA%\ImagePasteTool\PureRefCapture\20260828_153245
+        capture_dir = make_timestamp_capture_dir()
+
+        log('PureRef：正在导出选中图片…')
+        UI_QUEUE.put(('status', 'PureRef：正在捕获选中图片…'))
+        show_batch_progress("PureRef 捕获", 0, 0, "正在建立 PureRef 导出会话…")
+
+        wait_hotkey_release()
+        user32.SetForegroundWindow(info['hwnd'])
+        time.sleep(0.006)
+        send_ctrl_shift_i()
+
+        files, error = automate_pureref_export(
+            info['pid'], info['hwnd'], capture_dir
+        )
+        if not files:
+            shutil.rmtree(capture_dir, ignore_errors=True)
+            log(f'PureRef 捕获失败：{error}')
+            show_batch_progress(
+                "PureRef 捕获失败", 0, 0,
+                error or "没有导出任何图片",
+                completed=True
+            )
+            return
+
+        # PureRef capture is conceptually a copy operation too, so place the
+        # independent exported images into history NOW, not when they are pasted.
+        try:
+            history_session_id = None
+            for p in files:
+                history_session_id = history_append_image(
+                    history_session_id,
+                    source="pureref",
+                    label=Path(p).name,
+                    source_path=p
+                )
+            UI_QUEUE.put(("history_changed", None))
+            log(f"历史捕获 PureRef：{len(files)} 张")
+        except Exception as history_error:
+            log(f"PureRef 写入历史失败：{history_error}")
+
+        seq = clipboard_seq()
+        start_batch_queue(
+            [str(p) for p in files],
+            source='pureref',
+            temp_dir=capture_dir,
+            initial_seq=seq
+        )
+
+        with CONFIG_LOCK:
+            paste_mode = CONFIG['batch_mode']
+        mode_text = '逐张粘贴' if paste_mode == 'one' else '一次性全粘贴'
+        msg = f'PureRef 已捕获 {len(files)} 张；切到目标软件按粘贴快捷键（{mode_text}）'
+        log(msg)
+        UI_QUEUE.put(('status', msg))
+        show_batch_progress(
+            "PureRef 捕获完成", len(files), len(files),
+            f"已捕获 {len(files)} 张",
+            completed=True
+        )
+
+    except Exception as e:
+        msg = f'PureRef 捕获失败：{e}'
+        log(msg)
+        show_batch_progress(
+            "PureRef 捕获失败", 0, 0, str(e), completed=True
+        )
+    finally:
+        if session_pid is not None:
+            _set_pureref_capture_session(
+                False,
+                pid=session_pid,
+                grace_sec=2.0
+            )
+        PUREREF_CAPTURE_LOCK.release()
+
+
+# --- Batch / counter -----------------------------------------------------------
+
+def clipboard_seq():
+    try:
+        return int(user32.GetClipboardSequenceNumber())
+    except Exception:
+        return 0
+
+def clear_batch_queue(hide_counter=False, delete_temp=True):
+    global BATCH_QUEUE, BATCH_TOTAL, BATCH_DONE, BATCH_LAST_OWN_SEQ
+    global BATCH_SOURCE, BATCH_TEMP_DIR, BATCH_HISTORY_ID
+    global BATCH_COPY_GENERATION
+
+    temp_to_delete = None
+    with BATCH_LOCK:
+        if delete_temp and BATCH_TEMP_DIR:
+            temp_to_delete = Path(BATCH_TEMP_DIR)
+        BATCH_QUEUE = []
+        BATCH_TOTAL = 0
+        BATCH_DONE = 0
+        BATCH_LAST_OWN_SEQ = None
+        BATCH_SOURCE = None
+        BATCH_TEMP_DIR = None
+        BATCH_HISTORY_ID = None
+        BATCH_COPY_GENERATION = external_copy_generation()
+
+    if temp_to_delete:
+        try:
+            shutil.rmtree(temp_to_delete, ignore_errors=True)
+        except Exception:
+            pass
+
+    if hide_counter:
+        UI_QUEUE.put(("counter_hide", None))
+
+def start_batch_queue(paths, source="clipboard", temp_dir=None, initial_seq=None):
+    global BATCH_QUEUE, BATCH_TOTAL, BATCH_DONE, BATCH_LAST_OWN_SEQ
+    global BATCH_SOURCE, BATCH_TEMP_DIR, BATCH_HISTORY_ID
+    global BATCH_COPY_GENERATION
+    with BATCH_LOCK:
+        BATCH_QUEUE = list(paths)
+        BATCH_TOTAL = len(BATCH_QUEUE)
+        BATCH_DONE = 0
+        BATCH_LAST_OWN_SEQ = initial_seq
+        BATCH_SOURCE = source
+        BATCH_TEMP_DIR = str(temp_dir) if temp_dir else None
+        BATCH_HISTORY_ID = None
+        BATCH_COPY_GENERATION = external_copy_generation()
+
+def queue_progress():
+    with BATCH_LOCK:
+        return BATCH_DONE, BATCH_TOTAL, len(BATCH_QUEUE)
+
+def mark_own_clipboard():
+    global BATCH_LAST_OWN_SEQ
+    with BATCH_LOCK:
+        BATCH_LAST_OWN_SEQ = clipboard_seq()
+
+def clipboard_was_replaced_by_user():
+    """Did a REAL external copy happen after this batch was created?
+
+    V2.3.3 deliberately does NOT compare raw clipboard sequence numbers.
+    PureRef and ImagePasteTool legitimately change clipboard contents as part
+    of export/paste, and those changes must not invalidate a captured batch.
+    """
+    with BATCH_LOCK:
+        if not BATCH_QUEUE:
+            return True
+        batch_generation = int(BATCH_COPY_GENERATION)
+
+    return external_copy_generation() != batch_generation
+
+
+def show_counter(done, total, completed=False):
+    UI_QUEUE.put(("counter", {
+        "done": int(done),
+        "total": int(total),
+        "completed": bool(completed)
+    }))
+
+
+def make_batch_cache_dir():
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    folder = BATCH_CACHE_ROOT / f"{stamp}_{uuid.uuid4().hex[:6]}"
+    folder.mkdir(parents=True, exist_ok=False)
+    return folder
+
+
+def cleanup_stale_batch_cache():
+    try:
+        with CONFIG_LOCK:
+            hours = int(CONFIG.get("batch_cache_stale_hours", 24))
+        cutoff = time.time() - hours * 3600
+        for d in BATCH_CACHE_ROOT.iterdir():
+            try:
+                if d.is_dir() and d.stat().st_mtime < cutoff:
+                    shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+def show_batch_progress(stage, done=0, total=0, detail="", completed=False):
+    UI_QUEUE.put(("progress", {
+        "stage": str(stage),
+        "done": int(done),
+        "total": int(total),
+        "detail": str(detail or ""),
+        "completed": bool(completed),
+    }))
+
+
+def hide_batch_progress():
+    UI_QUEUE.put(("progress_hide", None))
+
+
+
+# --- Persistent history --------------------------------------------------------
+
+def _history_source_label(source):
+    return {
+        "pureref": "PureRef 捕获",
+        "clipboard": "Ctrl+C 文件",
+        "files": "Ctrl+C 文件",
+        "image": "Ctrl+C 图像",
+        "history": "历史回放",
+    }.get(str(source), str(source or "图片"))
+
+
+def _history_meta_path(session_dir):
+    return Path(session_dir) / "meta.json"
+
+
+def _read_history_meta(session_dir):
+    try:
+        path = _history_meta_path(session_dir)
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return None
+        raw["_dir"] = str(Path(session_dir))
+        raw.setdefault("items", [])
+        return raw
+    except Exception:
+        return None
+
+
+def _write_history_meta(session_dir, meta):
+    session_dir = Path(session_dir)
+    path = _history_meta_path(session_dir)
+    temp = path.with_suffix(".tmp")
+    clean = dict(meta)
