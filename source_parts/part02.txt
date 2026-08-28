@@ -1,0 +1,381 @@
+    for part in parts:
+        if part == "CTRL":
+            modifiers |= MOD_CONTROL
+        elif part == "ALT":
+            modifiers |= MOD_ALT
+        elif part == "SHIFT":
+            modifiers |= MOD_SHIFT
+        elif part == "WIN":
+            modifiers |= MOD_WIN
+        elif len(part) == 1 and (part.isdigit() or ("A" <= part <= "Z")):
+            vk = ord(part)
+        elif part.startswith("F") and part[1:].isdigit() and 1 <= int(part[1:]) <= 24:
+            vk = 0x70 + int(part[1:]) - 1
+        else:
+            raise ValueError(f"不支持的快捷键部分：{part}")
+
+    if vk is None:
+        raise ValueError("快捷键必须包含 A-Z / 0-9 / F1-F24 中的一个主键")
+    return modifiers, vk
+
+def load_config():
+    cfg = DEFAULT_CONFIG.copy()
+
+    # Portable config has priority.
+    loaded_portable = False
+    try:
+        if CONFIG_PATH.exists():
+            raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                cfg.update(raw)
+                loaded_portable = True
+    except Exception:
+        pass
+
+    # One-time migration convenience from older AppData versions.
+    if not loaded_portable:
+        try:
+            if LEGACY_CONFIG_PATH.exists():
+                raw = json.loads(
+                    LEGACY_CONFIG_PATH.read_text(encoding="utf-8")
+                )
+                if isinstance(raw, dict):
+                    cfg.update(raw)
+        except Exception:
+            pass
+
+    cfg["hotkey"] = normalize_hotkey(
+        cfg.get("hotkey", "ALT+WIN+V")
+    )
+    cfg["pureref_capture_hotkey"] = normalize_hotkey(
+        cfg.get("pureref_capture_hotkey", "ALT+WIN+C")
+    )
+    cfg["one_by_one_hotkey"] = normalize_hotkey(
+        cfg.get("one_by_one_hotkey", "CTRL+ALT+WIN+V")
+    )
+    cfg["history_hotkey"] = normalize_hotkey(
+        cfg.get("history_hotkey", "CTRL+ALT+WIN+C")
+    )
+    cfg["limit_mb"] = 32 if int(cfg.get("limit_mb", 20)) == 32 else 20
+    cfg["compression_enabled"] = bool(cfg.get("compression_enabled", True))
+    cfg["auto_paste"] = bool(cfg.get("auto_paste", True))
+    cfg["batch_mode"] = "one" if cfg.get("batch_mode") == "one" else "all"
+    cfg["batch_stream_processing"] = bool(
+        cfg.get("batch_stream_processing", True)
+    )
+    try:
+        cfg["batch_paste_delay_ms"] = min(
+            1600, max(300, int(cfg.get("batch_paste_delay_ms", 650)))
+        )
+    except Exception:
+        cfg["batch_paste_delay_ms"] = 650
+    try:
+        cfg["pureref_export_timeout_sec"] = min(
+            30, max(3, int(cfg.get("pureref_export_timeout_sec", 8)))
+        )
+    except Exception:
+        cfg["pureref_export_timeout_sec"] = 8
+    try:
+        cfg["pureref_export_hard_timeout_sec"] = min(
+            3600, max(30, int(cfg.get("pureref_export_hard_timeout_sec", 600)))
+        )
+    except Exception:
+        cfg["pureref_export_hard_timeout_sec"] = 600
+    try:
+        cfg["pureref_export_settle_ms"] = min(
+            3000, max(300, int(cfg.get("pureref_export_settle_ms", 600)))
+        )
+    except Exception:
+        cfg["pureref_export_settle_ms"] = 600
+    try:
+        cfg["pureref_process_io_idle_ms"] = min(
+            5000, max(300, int(cfg.get("pureref_process_io_idle_ms", 900)))
+        )
+    except Exception:
+        cfg["pureref_process_io_idle_ms"] = 900
+    try:
+        cfg["pureref_process_cpu_idle_ms"] = min(
+            10000, max(500, int(cfg.get("pureref_process_cpu_idle_ms", 1500)))
+        )
+    except Exception:
+        cfg["pureref_process_cpu_idle_ms"] = 1500
+    try:
+        cfg["pureref_cpu_activity_threshold_ms"] = min(
+            50.0,
+            max(0.1, float(cfg.get("pureref_cpu_activity_threshold_ms", 1.0)))
+        )
+    except Exception:
+        cfg["pureref_cpu_activity_threshold_ms"] = 1.0
+    try:
+        cfg["pureref_dialog_close_grace_ms"] = min(
+            3000, max(100, int(cfg.get("pureref_dialog_close_grace_ms", 350)))
+        )
+    except Exception:
+        cfg["pureref_dialog_close_grace_ms"] = 350
+    try:
+        cfg["pureref_single_file_confirm_ms"] = min(
+            15000, max(1500, int(cfg.get("pureref_single_file_confirm_ms", 5000)))
+        )
+    except Exception:
+        cfg["pureref_single_file_confirm_ms"] = 5000
+    try:
+        cfg["pureref_multi_file_confirm_ms"] = min(
+            5000, max(400, int(cfg.get("pureref_multi_file_confirm_ms", 900)))
+        )
+    except Exception:
+        cfg["pureref_multi_file_confirm_ms"] = 900
+    cfg["pureref_capture_base"] = str(
+        cfg.get("pureref_capture_base", "") or ""
+    ).strip()
+    try:
+        cfg["batch_preload_workers"] = min(
+            4, max(1, int(cfg.get("batch_preload_workers", 2)))
+        )
+    except Exception:
+        cfg["batch_preload_workers"] = 2
+    try:
+        cfg["batch_cache_stale_hours"] = min(
+            168, max(1, int(cfg.get("batch_cache_stale_hours", 24)))
+        )
+    except Exception:
+        cfg["batch_cache_stale_hours"] = 24
+
+    try:
+        history_days = int(cfg.get("history_retention_days", 30))
+    except Exception:
+        history_days = 30
+    if history_days not in (0, 1, 3, 7, 14, 30, 90):
+        history_days = 30
+    cfg["history_retention_days"] = history_days
+    cfg["history_view_mode"] = (
+        "mixed" if cfg.get("history_view_mode") == "mixed" else "standard"
+    )
+
+    cfg["storage_root"] = str(
+        cfg.get("storage_root", "") or ""
+    ).strip()
+
+    cfg["startup"] = bool(cfg.get("startup", False))
+    cfg["notify_success"] = bool(cfg.get("notify_success", True))
+    try:
+        cfg["png_compress_level"] = min(9, max(0, int(cfg.get("png_compress_level", 6))))
+    except Exception:
+        cfg["png_compress_level"] = 6
+    return cfg
+
+CONFIG = load_config()
+
+
+def resolve_storage_root(value=None):
+    """Resolve the portable data/output root.
+
+    Empty value means:
+        <ImagePasteTool.exe folder>\ImagePasteTool_Data
+
+    Relative paths are also resolved relative to the EXE folder.
+    """
+    if value is None:
+        with CONFIG_LOCK:
+            value = CONFIG.get("storage_root", "")
+
+    raw = str(value or "").strip()
+    if not raw:
+        return APP_DIR / "ImagePasteTool_Data"
+
+    expanded = Path(os.path.expandvars(raw)).expanduser()
+    if not expanded.is_absolute():
+        expanded = APP_DIR / expanded
+    return expanded.resolve()
+
+
+def test_writable_folder(folder):
+    """Create the directory and perform one real write/delete test."""
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    probe = folder / f".write_test_{uuid.uuid4().hex}.tmp"
+    probe.write_text("ok", encoding="utf-8")
+    probe.unlink(missing_ok=True)
+    return folder
+
+
+def apply_storage_paths():
+    """Apply storage root once at startup.
+
+    Changing storage_root in settings is saved immediately but deliberately
+    requires an app restart, avoiding unsafe live relocation of open history/
+    cache/log files.
+    """
+    global DATA_DIR, LOG_PATH
+    global PUREREF_TEMP_ROOT, BATCH_CACHE_ROOT, HISTORY_ROOT
+
+    root = resolve_storage_root()
+    try:
+        root = test_writable_folder(root)
+    except Exception as e:
+        # Do not silently fall back to C:. Keep the failure explicit.
+        raise RuntimeError(
+            f"数据/输出目录不可写：{root}\\n{e}\\n"
+            "请把程序放到可写目录，或在 config.json 中设置 storage_root。"
+        )
+
+    DATA_DIR = root
+    LOG_PATH = root / "activity.log"
+    PUREREF_TEMP_ROOT = root / "PureRefCapture"
+    BATCH_CACHE_ROOT = root / "BatchCache"
+    HISTORY_ROOT = root / "History"
+
+    for folder in (
+        PUREREF_TEMP_ROOT,
+        BATCH_CACHE_ROOT,
+        HISTORY_ROOT,
+    ):
+        folder.mkdir(parents=True, exist_ok=True)
+
+
+apply_storage_paths()
+
+
+def get_pureref_capture_base():
+    """Stable base directory; each capture gets a second-resolution subfolder."""
+    with CONFIG_LOCK:
+        configured = str(CONFIG.get("pureref_capture_base", "") or "").strip()
+
+    if configured:
+        base = Path(os.path.expandvars(configured)).expanduser()
+        if not base.is_absolute():
+            base = APP_DIR / base
+    else:
+        # Default follows the user-selectable portable data root.
+        base = PUREREF_TEMP_ROOT
+
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+def make_timestamp_capture_dir():
+    """Create YYYYMMDD_HHMMSS; add suffix only for two captures in same second."""
+    base = get_pureref_capture_base()
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    folder = base / stamp
+    if folder.exists():
+        n = 2
+        while (base / f"{stamp}_{n}").exists():
+            n += 1
+        folder = base / f"{stamp}_{n}"
+    folder.mkdir(parents=True, exist_ok=False)
+    return folder
+
+
+def save_config():
+    with CONFIG_LOCK:
+        try:
+            CONFIG_PATH.write_text(
+                json.dumps(CONFIG, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+        except Exception as e:
+            raise OSError(
+                f"无法写入配置文件：{CONFIG_PATH}\n{e}\n"
+                "请把 ImagePasteTool 放在有写入权限的目录。"
+            ) from e
+
+# --- Logging / notification ---------------------------------------------------
+
+def log(message):
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(f"[{stamp}] {message}\n")
+    except Exception:
+        pass
+    UI_QUEUE.put(("status", message))
+
+def notify(message):
+    """Show a message in ImagePasteTool's own bottom-right overlay.
+
+    V2.2.8 intentionally avoids Windows toast notifications.
+    """
+    try:
+        UI_QUEUE.put(("app_notice", str(message)))
+    except Exception:
+        pass
+
+
+def mb(n):
+    return n / (1024 * 1024)
+
+# --- Startup ------------------------------------------------------------------
+
+def startup_command():
+    if getattr(sys, "frozen", False):
+        return f'"{Path(sys.executable).resolve()}"'
+    exe = Path(sys.executable)
+    pythonw = exe.with_name("pythonw.exe")
+    runner = pythonw if pythonw.exists() else exe
+    return f'"{runner.resolve()}" "{Path(__file__).resolve()}"'
+
+def apply_startup(enabled):
+    import winreg
+    key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            key_path,
+            0,
+            winreg.KEY_SET_VALUE
+        ) as key:
+            if enabled:
+                winreg.SetValueEx(
+                    key, APP_REG_NAME, 0, winreg.REG_SZ, startup_command()
+                )
+            else:
+                try:
+                    winreg.DeleteValue(key, APP_REG_NAME)
+                except FileNotFoundError:
+                    pass
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+# --- Image encoding / compression --------------------------------------------
+
+def normalize_image(img):
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
+
+    try:
+        img.seek(0)
+    except Exception:
+        pass
+
+    if img.mode in ("RGB", "RGBA"):
+        return img.copy()
+
+    if "A" in img.getbands():
+        return img.convert("RGBA")
+    return img.convert("RGB")
+
+def image_to_png_bytes(img, level=6):
+    bio = io.BytesIO()
+    img.save(bio, "PNG", optimize=True, compress_level=level)
+    return bio.getvalue()
+
+def image_to_dib_bytes(img):
+    # Windows CF_DIB = BMP minus the 14-byte BITMAPFILEHEADER.
+    # DIB fallback is RGB; PNG clipboard format preserves alpha.
+    rgb = img.convert("RGB")
+    bio = io.BytesIO()
+    rgb.save(bio, "BMP")
+    return bio.getvalue()[14:]
+
+def fit_under_limit(img, limit_bytes, level):
+    work = img
+    data = image_to_png_bytes(work, level)
+
+    if len(data) <= limit_bytes:
+        return work, data, False, 0
+
+    for i in range(1, 16):
+        ratio = math.sqrt(limit_bytes / max(len(data), 1)) * 0.94
+        ratio = min(0.94, max(0.50, ratio))
