@@ -1,0 +1,321 @@
+    last_cpu_activity = started
+
+    slow_fallback_after = started + 3.0
+    handled_folder = set()
+    clicked_export = set()
+    clicked_browse = set()
+
+    last_ui_state = None
+
+    def set_status(stage, detail, done=0, total=0):
+        nonlocal last_ui_state
+        state = (stage, detail, done, total)
+        if state == last_ui_state:
+            return
+        last_ui_state = state
+        show_batch_progress(stage, done, total, detail)
+
+    while True:
+        now = time.perf_counter()
+
+        if now - started >= hard_timeout:
+            files = _list_exported_images(folder)
+            return [], (
+                f"PureRef 导出超过最长等待时间；当前检测到 {len(files)} 张。"
+            )
+
+        # ------------------------------------------------------------
+        # A. Drive / observe PureRef export command lifecycle.
+        # ------------------------------------------------------------
+        dialog_before = _find_pureref_export_dialog_win32(pid, main_hwnd)
+        if dialog_before:
+            export_dialog_seen = True
+
+        driven_before = len(custom_driven)
+        _drive_pureref_custom_export_dialog(
+            pid, main_hwnd, folder, custom_driven
+        )
+
+        if len(custom_driven) > driven_before:
+            export_command_driven = True
+            export_dialog_seen = True
+            export_dialog_closed_at = None
+            last_activity = now
+            set_status(
+                "PureRef 导出",
+                "导出命令已提交，等待 PureRef 完成输出…"
+            )
+
+        dialog_now = _find_pureref_export_dialog_win32(pid, main_hwnd)
+
+        if export_command_driven:
+            if dialog_now:
+                export_dialog_closed_at = None
+                set_status(
+                    "PureRef 导出",
+                    "PureRef 导出流程仍在运行…"
+                )
+            elif export_dialog_seen and export_dialog_closed_at is None:
+                export_dialog_closed_at = now
+                last_activity = now
+                set_status(
+                    "PureRef 收尾",
+                    "导出窗口已关闭，确认磁盘写入是否结束…"
+                )
+
+        # ------------------------------------------------------------
+        # B. Observe PureRef process write I/O.
+        # ------------------------------------------------------------
+        io_now = _pureref_io_snapshot(pid)
+        if io_now is not None:
+            if last_io is None:
+                last_io = io_now
+                last_io_activity = now
+            elif io_now != last_io:
+                # PureRef itself performed new write operations / bytes.
+                last_io = io_now
+                last_io_activity = now
+                last_activity = now
+
+                files_now = _list_exported_images(folder)
+                set_status(
+                    "PureRef 输出",
+                    (
+                        f"PureRef 仍在写入数据 · "
+                        f"当前检测 {len(files_now)} 张"
+                    ),
+                    len(files_now),
+                    0
+                )
+
+        process_io_idle = (
+            io_now is None
+            or (now - last_io_activity >= io_idle_sec)
+        )
+
+        # ------------------------------------------------------------
+        # C. Observe PureRef CPU activity.
+        #
+        # This catches the important large-image case where PureRef has
+        # finished writing image N but spends several seconds decoding/
+        # encoding image N+1 before the next file appears on disk.
+        # ------------------------------------------------------------
+        cpu_now = _pureref_cpu_snapshot(pid)
+        if cpu_now is not None:
+            if last_cpu is None:
+                last_cpu = cpu_now
+                last_cpu_activity = now
+            else:
+                cpu_delta = max(0, int(cpu_now) - int(last_cpu))
+                last_cpu = cpu_now
+
+                if cpu_delta >= cpu_threshold_100ns:
+                    last_cpu_activity = now
+                    last_activity = now
+
+                    files_now = _list_exported_images(folder)
+                    set_status(
+                        "PureRef 处理大图",
+                        (
+                            f"PureRef 仍在计算/编码 · "
+                            f"当前检测 {len(files_now)} 张"
+                        ),
+                        len(files_now),
+                        0
+                    )
+
+        process_cpu_idle = (
+            cpu_now is None
+            or (now - last_cpu_activity >= cpu_idle_sec)
+        )
+
+        # ------------------------------------------------------------
+        # D. Observe dedicated export directory.
+        # ------------------------------------------------------------
+        files = _list_exported_images(folder)
+
+        if files:
+            try:
+                snapshot = tuple(
+                    (
+                        p.name,
+                        p.stat().st_size,
+                        p.stat().st_mtime_ns
+                    )
+                    for p in files
+                )
+            except Exception:
+                snapshot = tuple(p.name for p in files)
+
+            if snapshot != stable_snapshot:
+                stable_snapshot = snapshot
+                stable_since = now
+                if first_file_seen_at is None:
+                    first_file_seen_at = now
+                last_activity = now
+                set_status(
+                    "PureRef 输出",
+                    f"检测到 {len(files)} 张，目录仍在变化…",
+                    len(files),
+                    0
+                )
+
+        # Directory "stable for 600 ms" was too weak for PureRef.
+        # PureRef can write image #1, go quiet, then continue the rest later.
+        # Treat process I/O as supporting evidence only; final completion also
+        # needs an adaptive post-file observation window.
+        if len(files) <= 1:
+            required_quiet_sec = max(
+                settle_sec,
+                single_file_confirm_sec
+            )
+        else:
+            required_quiet_sec = max(
+                settle_sec,
+                multi_file_confirm_sec
+            )
+
+        directory_stable = bool(
+            files
+            and stable_since is not None
+            and now - stable_since >= required_quiet_sec
+        )
+
+        dialog_closed_long_enough = bool(
+            export_command_driven
+            and export_dialog_closed_at is not None
+            and now - export_dialog_closed_at >= dialog_close_grace_sec
+        )
+
+        # ------------------------------------------------------------
+        # D. Authoritative completion gate.
+        # ------------------------------------------------------------
+        if export_command_driven and files:
+            blockers = []
+
+            if not dialog_closed_long_enough:
+                blockers.append("导出流程尚未结束")
+            if not process_io_idle:
+                blockers.append("PureRef 仍在写入")
+            if not process_cpu_idle:
+                blockers.append("PureRef 仍在计算/编码")
+            if not directory_stable:
+                if len(files) == 1 and stable_since is not None:
+                    remain = max(
+                        0.0,
+                        required_quiet_sec - (now - stable_since)
+                    )
+                    blockers.append(
+                        f"单图确认中 {remain:.1f}s"
+                    )
+                else:
+                    blockers.append("确认是否还有后续图片")
+
+            if blockers:
+                set_status(
+                    "PureRef 导出",
+                    f"{len(files)} 张 · " + " · ".join(blockers),
+                    len(files),
+                    0
+                )
+            else:
+                set_status(
+                    "PureRef 校验",
+                    f"{len(files)} 张 · 正在验证文件完整性…",
+                    len(files),
+                    len(files)
+                )
+
+                if _verify_exported_images(files):
+                    show_batch_progress(
+                        "PureRef 导出完成",
+                        len(files),
+                        len(files),
+                        f"{len(files)} 张独立图片已确认完成"
+                    )
+                    log(
+                        "PureRef 导出会话完成："
+                        f"{len(files)} 张；"
+                        f"dialog_closed={dialog_closed_long_enough}；"
+                        f"io_idle={process_io_idle}；"
+                        f"cpu_idle={process_cpu_idle}；"
+                        f"dir_stable={directory_stable}；"
+                        f"confirm={required_quiet_sec:.2f}s"
+                    )
+                    return files, ""
+
+                # A file exists but isn't yet fully readable: treat as new
+                # activity and wait instead of accepting a partial export.
+                stable_since = now
+                last_activity = now
+                last_io_activity = now
+                set_status(
+                    "PureRef 收尾",
+                    f"{len(files)} 张 · 文件仍在完成写入…",
+                    len(files),
+                    0
+                )
+
+        # ------------------------------------------------------------
+        # E. UI Automation compatibility fallback.
+        # ------------------------------------------------------------
+        if now >= slow_fallback_after and not export_command_driven:
+            try:
+                windows = Desktop(
+                    backend='uia'
+                ).windows(visible_only=True)
+            except Exception:
+                windows = []
+
+            candidates = []
+            for win in windows:
+                try:
+                    if int(win.element_info.process_id) != int(pid):
+                        continue
+                    if int(win.handle) == int(main_hwnd):
+                        continue
+                    candidates.append(win)
+                except Exception:
+                    continue
+
+            for win in candidates:
+                handle = int(getattr(win, 'handle', 0) or 0)
+                all_text = _all_dialog_text(win)
+                low = all_text.lower()
+
+                if any(x in low for x in (
+                    'no images selected',
+                    'nothing selected',
+                    'no image selected',
+                    '没有选择图片',
+                    '未选择图片',
+                    '没有选中'
+                )):
+                    _click_button_by_words(win, ('ok', '确定'))
+                    return [], 'PureRef 当前没有选中可导出的图片'
+
+                if _looks_like_folder_dialog(win):
+                    if handle not in handled_folder:
+                        if _handle_folder_dialog(win, folder):
+                            handled_folder.add(handle)
+                            last_activity = now
+                    continue
+
+                if 'export' in low or '导出' in low or candidates:
+                    _try_select_png(win)
+                    path_set = _try_set_export_path(win, folder)
+
+                    if path_set and handle not in clicked_export:
+                        if _click_button_by_words(
+                            win,
+                            (
+                                'export',
+                                '导出',
+                                'save',
+                                '保存',
+                                'ok',
+                                '确定'
+                            )
+                        ):
+                            clicked_export.add(handle)
+                            export_command_driven = True
