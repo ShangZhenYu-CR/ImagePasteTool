@@ -1,0 +1,405 @@
+        new_size = (
+            max(1, int(work.width * ratio)),
+            max(1, int(work.height * ratio))
+        )
+        if new_size == work.size:
+            break
+
+        work = work.resize(new_size, Image.Resampling.LANCZOS)
+        data = image_to_png_bytes(work, level)
+        if len(data) <= limit_bytes:
+            return work, data, True, i
+
+    # Conservative fallback.
+    for j in range(10):
+        if len(data) <= limit_bytes:
+            break
+        new_size = (
+            max(1, int(work.width * 0.88)),
+            max(1, int(work.height * 0.88))
+        )
+        if new_size == work.size:
+            break
+        work = work.resize(new_size, Image.Resampling.LANCZOS)
+        data = image_to_png_bytes(work, 9)
+
+    return work, data, True, 25
+
+def prepare_image(img):
+    img = normalize_image(img)
+    original_size = img.size
+
+    with CONFIG_LOCK:
+        limit_mb = int(CONFIG["limit_mb"])
+        compression_enabled = bool(CONFIG["compression_enabled"])
+        level = int(CONFIG["png_compress_level"])
+
+    before_png = image_to_png_bytes(img, level)
+
+    if compression_enabled and len(before_png) > limit_mb * 1024 * 1024:
+        final_img, final_png, resized, iterations = fit_under_limit(
+            img,
+            limit_mb * 1024 * 1024,
+            level
+        )
+    else:
+        final_img = img
+        final_png = before_png
+        resized = False
+        iterations = 0
+
+    return {
+        "image": final_img,
+        "png": final_png,
+        "before_png_bytes": len(before_png),
+        "after_png_bytes": len(final_png),
+        "original_px": original_size,
+        "output_px": final_img.size,
+        "resized": resized,
+        "iterations": iterations,
+        "limit_mb": limit_mb,
+        "compression_enabled": compression_enabled,
+    }
+
+# --- Clipboard source reading -------------------------------------------------
+
+def read_clipboard_source():
+    """
+    Returns a dict:
+      {"kind": "image", "image": PIL.Image}
+      {"kind": "files", "paths": [...]}
+      {"kind": "none"}
+    Pillow ImageGrab.grabclipboard() on Windows handles both direct images
+    and CF_HDROP file lists.
+    """
+    data = ImageGrab.grabclipboard()
+
+    if isinstance(data, Image.Image):
+        return {"kind": "image", "image": data}
+
+    if isinstance(data, list):
+        paths = [
+            str(p) for p in data
+            if Path(str(p)).is_file()
+            and Path(str(p)).suffix.lower() in SUPPORTED_EXTS
+        ]
+        if paths:
+            return {"kind": "files", "paths": paths}
+
+    return {"kind": "none"}
+
+
+
+def clipboard_owner_pid():
+    """Best-effort PID of the application that currently owns clipboard data."""
+    try:
+        hwnd = user32.GetClipboardOwner()
+        if not hwnd:
+            return None
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return int(pid.value) if pid.value else None
+    except Exception:
+        return None
+
+
+def external_copy_generation():
+    with CLIPBOARD_MONITOR_LOCK:
+        return int(EXTERNAL_COPY_GENERATION)
+
+
+def _increment_external_copy_generation():
+    global EXTERNAL_COPY_GENERATION
+    with CLIPBOARD_MONITOR_LOCK:
+        EXTERNAL_COPY_GENERATION += 1
+        return int(EXTERNAL_COPY_GENERATION)
+
+
+def _set_pureref_capture_session(active, pid=None, grace_sec=0.0):
+    global PURE_REF_CAPTURE_ACTIVE, PURE_REF_ACTIVE_PID
+    global PURE_REF_CLIPBOARD_IGNORE_UNTIL
+
+    with PURE_REF_SESSION_LOCK:
+        PURE_REF_CAPTURE_ACTIVE = bool(active)
+        if active:
+            PURE_REF_ACTIVE_PID = int(pid) if pid else None
+            PURE_REF_CLIPBOARD_IGNORE_UNTIL = 0.0
+        else:
+            # Keep ignoring PureRef-owned clipboard churn briefly after the
+            # export has finished. Some PureRef builds publish clipboard data
+            # a little after the export dialog closes.
+            if pid:
+                PURE_REF_ACTIVE_PID = int(pid)
+            PURE_REF_CLIPBOARD_IGNORE_UNTIL = (
+                time.time() + max(0.0, float(grace_sec))
+            )
+
+
+def _should_ignore_clipboard_change_for_pureref():
+    """True when this clipboard change belongs to the active/pending PureRef flow."""
+    with PURE_REF_SESSION_LOCK:
+        active = PURE_REF_CAPTURE_ACTIVE
+        pureref_pid = PURE_REF_ACTIVE_PID
+        ignore_until = PURE_REF_CLIPBOARD_IGNORE_UNTIL
+
+    if active:
+        return True
+
+    owner_pid = clipboard_owner_pid()
+
+    # Short post-capture grace catches delayed PureRef clipboard publication.
+    if (
+        pureref_pid is not None
+        and time.time() < ignore_until
+        and owner_pid == pureref_pid
+    ):
+        return True
+
+    # If a valid PureRef batch is already pending, PureRef-owned clipboard
+    # churn must not destroy it. Only a copy owned by another application
+    # counts as a new external copy.
+    with BATCH_LOCK:
+        pureref_pending = bool(BATCH_QUEUE) and BATCH_SOURCE == "pureref"
+
+    if (
+        pureref_pending
+        and pureref_pid is not None
+        and owner_pid == pureref_pid
+    ):
+        return True
+
+    return False
+
+
+
+def _tool_clipboard_write_begin():
+    global TOOL_CLIPBOARD_WRITE_DEPTH
+    with CLIPBOARD_MONITOR_LOCK:
+        TOOL_CLIPBOARD_WRITE_DEPTH += 1
+
+
+def _tool_clipboard_write_end():
+    global TOOL_CLIPBOARD_WRITE_DEPTH, LAST_TOOL_CLIPBOARD_SEQ
+    with CLIPBOARD_MONITOR_LOCK:
+        LAST_TOOL_CLIPBOARD_SEQ = clipboard_seq()
+        TOOL_CLIPBOARD_WRITE_DEPTH = max(
+            0, TOOL_CLIPBOARD_WRITE_DEPTH - 1
+        )
+
+
+def _clipboard_change_is_tool_owned(seq):
+    with CLIPBOARD_MONITOR_LOCK:
+        return (
+            TOOL_CLIPBOARD_WRITE_DEPTH > 0
+            or (
+                LAST_TOOL_CLIPBOARD_SEQ is not None
+                and int(seq) == int(LAST_TOOL_CLIPBOARD_SEQ)
+            )
+        )
+
+
+# --- Clipboard writing --------------------------------------------------------
+
+def open_clipboard(retries=40, delay=0.025):
+    for _ in range(retries):
+        if user32.OpenClipboard(None):
+            return True
+        time.sleep(delay)
+    return False
+
+def set_clipboard_blob(fmt, data):
+    hmem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+    if not hmem:
+        raise MemoryError("GlobalAlloc failed")
+
+    ptr = kernel32.GlobalLock(hmem)
+    if not ptr:
+        kernel32.GlobalFree(hmem)
+        raise MemoryError("GlobalLock failed")
+
+    try:
+        ctypes.memmove(ptr, data, len(data))
+    finally:
+        kernel32.GlobalUnlock(hmem)
+
+    result = user32.SetClipboardData(fmt, hmem)
+    if not result:
+        kernel32.GlobalFree(hmem)
+        raise OSError("SetClipboardData failed")
+
+def write_image_clipboard(img, png_bytes):
+    dib_bytes = image_to_dib_bytes(img)
+    _tool_clipboard_write_begin()
+
+    try:
+        if not open_clipboard():
+            raise OSError("剪贴板正被其他程序占用")
+
+        try:
+            if not user32.EmptyClipboard():
+                raise OSError("清空剪贴板失败")
+            # Registered PNG: preferred by many Chromium/Electron apps.
+            set_clipboard_blob(PNG_FORMAT, png_bytes)
+            # CF_DIB fallback: broad compatibility with Windows desktop apps.
+            set_clipboard_blob(CF_DIB, dib_bytes)
+        finally:
+            user32.CloseClipboard()
+    finally:
+        _tool_clipboard_write_end()
+
+
+# --- Auto-paste ---------------------------------------------------------------
+
+def key_is_down(vk):
+    return bool(user32.GetAsyncKeyState(vk) & 0x8000)
+
+def wait_hotkey_release(timeout=1.5):
+    started = time.time()
+    while time.time() - started < timeout:
+        if not any(
+            key_is_down(v)
+            for v in (VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN)
+        ):
+            return
+        time.sleep(0.02)
+
+def send_ctrl_v():
+    user32.keybd_event(VK_CONTROL, 0, 0, 0)
+    user32.keybd_event(VK_V, 0, 0, 0)
+    user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
+    user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+
+# --- PureRef selected-image capture -------------------------------------------
+
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+def _window_title(hwnd):
+    try:
+        length = user32.GetWindowTextLengthW(hwnd)
+        buf = ctypes.create_unicode_buffer(max(2, length + 1))
+        user32.GetWindowTextW(hwnd, buf, len(buf))
+        return buf.value
+    except Exception:
+        return ""
+
+
+def _process_exe(pid):
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return ""
+    try:
+        size = wintypes.DWORD(32768)
+        buf = ctypes.create_unicode_buffer(size.value)
+        if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return buf.value
+        return ""
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def foreground_pureref():
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return None
+    pid = wintypes.DWORD(0)
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    title = _window_title(hwnd)
+    exe = _process_exe(pid.value)
+    if "pureref" in title.lower() or "pureref" in Path(exe).name.lower():
+        return {"hwnd": hwnd, "pid": int(pid.value), "title": title, "exe": exe}
+    return None
+
+
+def send_ctrl_shift_i():
+    user32.keybd_event(VK_CONTROL, 0, 0, 0)
+    user32.keybd_event(VK_SHIFT, 0, 0, 0)
+    user32.keybd_event(VK_I, 0, 0, 0)
+    user32.keybd_event(VK_I, 0, KEYEVENTF_KEYUP, 0)
+    user32.keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
+    user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+
+
+def _safe_text(control):
+    try:
+        return control.window_text() or ""
+    except Exception:
+        return ""
+
+
+def _all_dialog_text(win):
+    parts = [_safe_text(win)]
+    try:
+        for c in win.descendants():
+            s = _safe_text(c)
+            if s:
+                parts.append(s)
+    except Exception:
+        pass
+    return " | ".join(parts)
+
+
+def _looks_like_folder_dialog(win):
+    title = _safe_text(win).lower()
+    class_name = ""
+    try:
+        class_name = (win.class_name() or "").lower()
+    except Exception:
+        pass
+    keys = (
+        "select folder", "choose folder", "browse for folder", "select a folder",
+        "选择文件夹", "选择一个文件夹", "浏览文件夹", "文件夹"
+    )
+    if any(k in title for k in keys):
+        return True
+    if class_name == "#32770":
+        text = _all_dialog_text(win).lower()
+        return any(k in text for k in ("folder", "文件夹", "select", "选择"))
+    return False
+
+
+def _escape_send_keys_text(value):
+    # pywinauto send_keys treats these as syntax characters.
+    special = set('+^%~(){}[]')
+    out = []
+    for ch in str(value):
+        out.append('{' + ch + '}' if ch in special else ch)
+    return ''.join(out)
+
+
+def _read_clipboard_unicode_text():
+    """Best-effort Win32 clipboard text read used only to verify PureRef path entry."""
+    if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+        return ""
+    if not open_clipboard(retries=8, delay=0.01):
+        return ""
+    try:
+        handle = user32.GetClipboardData(CF_UNICODETEXT)
+        if not handle:
+            return ""
+        ptr = kernel32.GlobalLock(handle)
+        if not ptr:
+            return ""
+        try:
+            return ctypes.wstring_at(ptr)
+        finally:
+            kernel32.GlobalUnlock(handle)
+    except Exception:
+        return ""
+    finally:
+        user32.CloseClipboard()
+
+
+def _same_path_text(a, b):
+    try:
+        return os.path.normcase(os.path.normpath(str(a).strip().strip('"'))) == \
+               os.path.normcase(os.path.normpath(str(b).strip().strip('"')))
+    except Exception:
+        return str(a).strip() == str(b).strip()
+
+
+def _write_clipboard_unicode_text(value):
+    """Put a whole path on clipboard for instant Ctrl+V, but do not history-capture it."""
+    data = (str(value) + "\0").encode("utf-16-le")
+    hmem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+    if not hmem:
