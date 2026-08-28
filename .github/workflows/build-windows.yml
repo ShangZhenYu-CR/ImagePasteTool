@@ -10,6 +10,8 @@ on:
       - "build_windows_exe.bat"
       - ".github/workflows/build-windows.yml"
 
+# Source is stored in validated chunks so the connector can maintain it safely.
+# tools/assemble_source.py rebuilds the single .pyw before PyInstaller runs.
 jobs:
   build:
     runs-on: windows-latest
