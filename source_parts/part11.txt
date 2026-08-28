@@ -1,0 +1,292 @@
+        ttk.Label(outer, text="连续粘贴间隔").grid(
+            row=12, column=0, sticky="w", pady=6
+        )
+        ttk.Combobox(
+            outer,
+            textvariable=self.batch_delay_var,
+            values=("400", "650", "900", "1200"),
+            width=10,
+            state="readonly"
+        ).grid(row=12, column=1, sticky="w", pady=6)
+        ttk.Label(outer, text="ms；网页/ChatGPT 建议 650").grid(
+            row=12, column=2, sticky="w", padx=(8, 0)
+        )
+
+        ttk.Label(outer, text="历史保留时间").grid(
+            row=13, column=0, sticky="w", pady=6
+        )
+        ttk.Combobox(
+            outer,
+            textvariable=self.history_retention_var,
+            values=("1 天", "3 天", "7 天", "14 天", "30 天", "90 天", "永久"),
+            width=12,
+            state="readonly"
+        ).grid(row=13, column=1, sticky="w", pady=6)
+        ttk.Label(
+            outer,
+            text="只在软件启动时检查并清理",
+            wraplength=220
+        ).grid(row=13, column=2, sticky="w", padx=(8, 0))
+
+        ttk.Checkbutton(
+            outer,
+            text="Windows 登录后自动启动",
+            variable=self.startup_var
+        ).grid(row=16, column=0, columnspan=3, sticky="w", pady=6)
+
+        ttk.Checkbutton(
+            outer,
+            text="成功完成后显示右下角状态提示",
+            variable=self.notify_var
+        ).grid(row=15, column=0, columnspan=3, sticky="w", pady=6)
+
+        ttk.Separator(outer).grid(
+            row=16, column=0, columnspan=3, sticky="ew", pady=14
+        )
+
+        ttk.Label(outer, text="状态").grid(row=17, column=0, sticky="nw")
+        ttk.Label(
+            outer, textvariable=self.status_var, wraplength=420
+        ).grid(row=17, column=1, columnspan=2, sticky="w")
+
+        buttons = ttk.Frame(outer)
+        buttons.grid(row=18, column=0, columnspan=3, sticky="e", pady=(16, 0))
+        ttk.Button(
+            buttons,
+            text="历史剪贴板",
+            command=lambda: UI_QUEUE.put(("open_history", None))
+        ).pack(side="left")
+        ttk.Button(buttons, text="打开日志", command=self.open_log).pack(
+            side="left", padx=(8, 0)
+        )
+        ttk.Button(buttons, text="保存设置", command=self.save).pack(
+            side="left", padx=(8, 0)
+        )
+        ttk.Button(buttons, text="隐藏", command=self.top.withdraw).pack(
+            side="left", padx=(8, 0)
+        )
+
+        self.refresh()
+
+    def refresh(self):
+        with CONFIG_LOCK:
+            self.hotkey_var.set(CONFIG["hotkey"])
+            self.pureref_hotkey_var.set(CONFIG["pureref_capture_hotkey"])
+            self.one_hotkey_var.set(CONFIG["one_by_one_hotkey"])
+            self.history_hotkey_var.set(CONFIG["history_hotkey"])
+            self.storage_root_var.set(
+                str(resolve_storage_root(CONFIG.get("storage_root", "")))
+            )
+            self.limit_var.set(CONFIG["limit_mb"])
+            self.compression_var.set(CONFIG["compression_enabled"])
+            self.auto_paste_var.set(CONFIG["auto_paste"])
+            self.batch_mode_var.set(CONFIG["batch_mode"])
+            self.stream_batch_var.set(CONFIG["batch_stream_processing"])
+            self.batch_delay_var.set(str(CONFIG["batch_paste_delay_ms"]))
+            self.startup_var.set(CONFIG["startup"])
+            self.notify_var.set(CONFIG["notify_success"])
+            days = int(CONFIG["history_retention_days"])
+            self.history_retention_var.set(
+                "永久" if days == 0 else f"{days} 天"
+            )
+
+    def show(self):
+        self.refresh()
+        self.top.deiconify()
+        self.top.lift()
+        self.top.focus_force()
+
+    def set_status(self, text):
+        self.status_var.set(text)
+
+    def choose_storage_root(self):
+        initial = self.storage_root_var.get().strip()
+        if not initial:
+            initial = str(APP_DIR)
+        chosen = filedialog.askdirectory(
+            parent=self.top,
+            title="选择 ImagePasteTool 数据 / 输出根目录",
+            initialdir=initial if Path(initial).exists() else str(APP_DIR)
+        )
+        if chosen:
+            self.storage_root_var.set(chosen)
+
+    def open_log(self):
+        try:
+            if not LOG_PATH.exists():
+                LOG_PATH.write_text("", encoding="utf-8")
+            os.startfile(LOG_PATH)
+        except Exception as e:
+            messagebox.showerror(APP_NAME, str(e), parent=self.top)
+
+    def save(self):
+        new_hotkey = normalize_hotkey(self.hotkey_var.get())
+        new_pureref_hotkey = normalize_hotkey(self.pureref_hotkey_var.get())
+        new_one_hotkey = normalize_hotkey(self.one_hotkey_var.get())
+        new_history_hotkey = normalize_hotkey(self.history_hotkey_var.get())
+
+        try:
+            parse_hotkey(new_hotkey)
+            parse_hotkey(new_pureref_hotkey)
+            parse_hotkey(new_one_hotkey)
+            parse_hotkey(new_history_hotkey)
+
+            if len({
+                new_hotkey,
+                new_pureref_hotkey,
+                new_one_hotkey,
+                new_history_hotkey
+            }) != 4:
+                raise ValueError("四个全局快捷键不能相同")
+        except Exception as e:
+            messagebox.showerror("快捷键无效", str(e), parent=self.top)
+            return
+
+        requested_storage = self.storage_root_var.get().strip()
+        try:
+            resolved_storage = resolve_storage_root(requested_storage)
+            test_writable_folder(resolved_storage)
+        except Exception as e:
+            messagebox.showerror(
+                "输出目录不可写",
+                f"{e}",
+                parent=self.top
+            )
+            return
+
+        current_storage = resolve_storage_root(
+            CONFIG.get("storage_root", "")
+        )
+        storage_changed = (
+            os.path.normcase(str(resolved_storage))
+            != os.path.normcase(str(current_storage))
+        )
+
+        startup_enabled = bool(self.startup_var.get())
+        ok, err = apply_startup(startup_enabled)
+        if not ok:
+            messagebox.showerror(
+                "开机启动设置失败", err, parent=self.top
+            )
+            return
+
+        with CONFIG_LOCK:
+            CONFIG["hotkey"] = new_hotkey
+            CONFIG["pureref_capture_hotkey"] = new_pureref_hotkey
+            CONFIG["one_by_one_hotkey"] = new_one_hotkey
+            CONFIG["history_hotkey"] = new_history_hotkey
+            CONFIG["storage_root"] = str(resolved_storage)
+            CONFIG["limit_mb"] = 32 if self.limit_var.get() == 32 else 20
+            CONFIG["compression_enabled"] = bool(self.compression_var.get())
+            CONFIG["auto_paste"] = bool(self.auto_paste_var.get())
+            CONFIG["batch_mode"] = (
+                "one" if self.batch_mode_var.get() == "one" else "all"
+            )
+            CONFIG["batch_stream_processing"] = bool(
+                self.stream_batch_var.get()
+            )
+            try:
+                CONFIG["batch_paste_delay_ms"] = min(
+                    1600, max(300, int(self.batch_delay_var.get()))
+                )
+            except Exception:
+                CONFIG["batch_paste_delay_ms"] = 650
+
+            retention_text = self.history_retention_var.get().strip()
+            if retention_text == "永久":
+                CONFIG["history_retention_days"] = 0
+            else:
+                try:
+                    CONFIG["history_retention_days"] = int(
+                        retention_text.split()[0]
+                    )
+                except Exception:
+                    CONFIG["history_retention_days"] = 30
+
+            CONFIG["startup"] = startup_enabled
+            CONFIG["notify_success"] = bool(self.notify_var.get())
+
+        save_config()
+        clear_batch_queue(hide_counter=True)
+        request_hotkey_reload()
+
+        if tray_icon:
+            tray_icon.update_menu()
+
+        if storage_changed:
+            msg = "设置已保存；数据 / 输出根目录将在重启 ImagePasteTool 后生效"
+        else:
+            msg = "设置已保存"
+        self.status_var.set(msg)
+        notify(msg)
+        log(msg)
+
+
+class HistoryWindow:
+    THUMB_W = 150
+    THUMB_H = 112
+
+    def __init__(self, master):
+        self.top = tk.Toplevel(master)
+        self.top.title("ImagePasteTool - 历史剪贴板")
+        self.top.geometry("980x680")
+        self.top.minsize(760, 500)
+        self.top.protocol("WM_DELETE_WINDOW", self.top.withdraw)
+
+        self.mode_var = tk.StringVar()
+        self.info_var = tk.StringVar()
+        self._photos = []
+
+        toolbar = ttk.Frame(self.top, padding=(12, 10))
+        toolbar.pack(fill="x")
+
+        ttk.Label(toolbar, text="显示方式：").pack(side="left")
+        ttk.Radiobutton(
+            toolbar,
+            text="标准（每批一行）",
+            variable=self.mode_var,
+            value="standard",
+            command=self._mode_changed
+        ).pack(side="left")
+        ttk.Radiobutton(
+            toolbar,
+            text="混合（全部按时间）",
+            variable=self.mode_var,
+            value="mixed",
+            command=self._mode_changed
+        ).pack(side="left", padx=(10, 0))
+
+        ttk.Button(
+            toolbar, text="刷新", command=self.render
+        ).pack(side="right")
+        ttk.Button(
+            toolbar, text="打开历史目录", command=self.open_folder
+        ).pack(side="right", padx=(0, 8))
+
+        ttk.Label(
+            self.top,
+            textvariable=self.info_var,
+            padding=(12, 0, 12, 8)
+        ).pack(fill="x")
+
+        body = ttk.Frame(self.top)
+        body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        self.canvas = tk.Canvas(
+            body,
+            highlightthickness=0,
+            bd=0
+        )
+        self.vscroll = ttk.Scrollbar(
+            body, orient="vertical", command=self.canvas.yview
+        )
+        self.canvas.configure(yscrollcommand=self.vscroll.set)
+
+        self.vscroll.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        self.content = ttk.Frame(self.canvas)
+        self.content_window = self.canvas.create_window(
+            (0, 0), window=self.content, anchor="nw"
+        )
+
