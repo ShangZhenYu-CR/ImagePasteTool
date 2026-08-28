@@ -1,0 +1,403 @@
+    def _format_time(self, stamp):
+        try:
+            return time.strftime(
+                "%Y-%m-%d %H:%M:%S",
+                time.localtime(float(stamp))
+            )
+        except Exception:
+            return ""
+
+    def _photo_for_item(self, item):
+        try:
+            with Image.open(item["_thumb_path"]) as im:
+                im = im.convert("RGB")
+                im.thumbnail(
+                    (self.THUMB_W, self.THUMB_H),
+                    Image.Resampling.LANCZOS
+                )
+                photo = ImageTk.PhotoImage(im.copy())
+            self._photos.append(photo)
+            return photo
+        except Exception:
+            return None
+
+    def _load_paths(self, paths):
+        if load_history_batch(paths):
+            self.top.withdraw()
+
+    def _item_button(self, parent, item, extra_text=""):
+        photo = self._photo_for_item(item)
+        label = item.get("label") or Path(item["_file_path"]).name
+        if len(label) > 18:
+            label = label[:15] + "…"
+
+        text = label
+        if extra_text:
+            text = f"{label}\n{extra_text}"
+
+        btn = tk.Button(
+            parent,
+            image=photo if photo else "",
+            text=text,
+            compound="top",
+            width=self.THUMB_W if not photo else 0,
+            height=0 if photo else 7,
+            padx=5,
+            pady=5,
+            relief="groove",
+            command=lambda p=item["_file_path"]: self._load_paths([p])
+        )
+        if photo:
+            btn.image = photo
+        return btn
+
+    def _render_standard(self, sessions):
+        for meta in sessions:
+            items = meta["items"]
+            row = ttk.Frame(self.content, padding=8, relief="solid")
+            row.pack(fill="x", padx=4, pady=5)
+
+            header = ttk.Frame(row)
+            header.pack(fill="x")
+
+            stamp = self._format_time(
+                meta.get("created_at", meta.get("updated_at", 0))
+            )
+            source = _history_source_label(meta.get("source"))
+            ttk.Label(
+                header,
+                text=f"{stamp}    {source}    {len(items)} 张"
+            ).pack(side="left")
+
+            ttk.Button(
+                header,
+                text="载入整组",
+                command=lambda m=meta: self._load_paths(
+                    [x["_file_path"] for x in m["items"]]
+                )
+            ).pack(side="right")
+
+            # One history group is always ONE horizontal row.
+            thumb_wrap = ttk.Frame(row)
+            thumb_wrap.pack(fill="x", pady=(7, 0))
+
+            hcanvas = tk.Canvas(
+                thumb_wrap,
+                height=154,
+                highlightthickness=0,
+                bd=0
+            )
+            hscroll = ttk.Scrollbar(
+                thumb_wrap,
+                orient="horizontal",
+                command=hcanvas.xview
+            )
+            hcanvas.configure(xscrollcommand=hscroll.set)
+            hcanvas.pack(fill="x", expand=True)
+            hscroll.pack(fill="x")
+
+            inner = ttk.Frame(hcanvas)
+            win = hcanvas.create_window(
+                (0, 0), window=inner, anchor="nw"
+            )
+
+            for item in items:
+                card = self._item_button(inner, item)
+                card.pack(side="left", padx=(0, 7), pady=2)
+
+            inner.update_idletasks()
+            hcanvas.configure(scrollregion=hcanvas.bbox("all"))
+            hcanvas.itemconfigure(win, height=150)
+
+    def _render_mixed(self, sessions):
+        flattened = []
+        for meta in sessions:
+            for item in meta["items"]:
+                merged = dict(item)
+                merged["_source"] = meta.get("source")
+                merged["_session_time"] = meta.get("created_at", 0)
+                flattened.append(merged)
+
+        flattened.sort(
+            key=lambda x: float(
+                x.get("pasted_at", x.get("_session_time", 0))
+            ),
+            reverse=True
+        )
+
+        grid = ttk.Frame(self.content, padding=4)
+        grid.pack(fill="both", expand=True)
+
+        columns = 6
+        for i, item in enumerate(flattened):
+            stamp = self._format_time(
+                item.get("pasted_at", item.get("_session_time", 0))
+            )
+            short_time = stamp[5:] if len(stamp) >= 5 else stamp
+            card = self._item_button(
+                grid,
+                item,
+                extra_text=short_time
+            )
+            card.grid(
+                row=i // columns,
+                column=i % columns,
+                padx=5,
+                pady=5,
+                sticky="n"
+            )
+
+    def render(self):
+        self._clear()
+        sessions = list_history_sessions()
+
+        total_items = sum(len(x.get("items", [])) for x in sessions)
+        with CONFIG_LOCK:
+            days = int(CONFIG.get("history_retention_days", 30))
+        retention = "永久" if days == 0 else f"{days} 天"
+
+        self.info_var.set(
+            f"{len(sessions)} 个历史批次 · {total_items} 张图片 · "
+            f"保留 {retention}；过期清理只在软件启动时执行。"
+        )
+
+        if not sessions:
+            ttk.Label(
+                self.content,
+                text="还没有历史记录。",
+                padding=24
+            ).pack(anchor="center")
+            return
+
+        if self.mode_var.get() == "mixed":
+            self._render_mixed(sessions)
+        else:
+            self._render_standard(sessions)
+
+
+
+class CounterOverlay:
+    """Small always-on-top progress badge that never takes keyboard focus."""
+    def __init__(self, master):
+        self.top = tk.Toplevel(master)
+        self.top.withdraw()
+        self.top.overrideredirect(True)
+        self.top.attributes("-topmost", True)
+        try:
+            self.top.attributes("-alpha", 0.94)
+        except Exception:
+            pass
+
+        self.label = tk.Label(
+            self.top,
+            text="0 / 0",
+            font=("Segoe UI", 16, "bold"),
+            padx=18,
+            pady=8,
+            bg="#202124",
+            fg="#FFFFFF",
+            bd=0
+        )
+        self.label.pack()
+
+        self.hide_job = None
+        self.top.update_idletasks()
+        self._make_noactivate()
+
+    def _make_noactivate(self):
+        try:
+            hwnd = self.top.winfo_id()
+            style = _GetWindowLong(hwnd, GWL_EXSTYLE)
+            _SetWindowLong(
+                hwnd,
+                GWL_EXSTYLE,
+                style | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+            )
+        except Exception:
+            pass
+
+    def _position(self):
+        self.top.update_idletasks()
+        width = max(self.top.winfo_reqwidth(), 92)
+        height = max(self.top.winfo_reqheight(), 44)
+        sw = self.top.winfo_screenwidth()
+        sh = self.top.winfo_screenheight()
+        x = max(8, sw - width - 28)
+        y = max(8, sh - height - 76)
+        self.top.geometry(f"{width}x{height}+{x}+{y}")
+
+    def show(self, done, total, completed=False):
+        if self.hide_job is not None:
+            try:
+                self.top.after_cancel(self.hide_job)
+            except Exception:
+                pass
+            self.hide_job = None
+
+        self.label.config(text=f"{done} / {total}")
+        self._position()
+        self.top.update_idletasks()
+
+        try:
+            hwnd = self.top.winfo_id()
+            user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+            user32.SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
+            )
+        except Exception:
+            self.top.deiconify()
+
+        if completed:
+            self.hide_job = self.top.after(1500, self.hide)
+
+    def hide(self):
+        if self.hide_job is not None:
+            try:
+                self.top.after_cancel(self.hide_job)
+            except Exception:
+                pass
+            self.hide_job = None
+        self.top.withdraw()
+
+
+
+class ProgressOverlay:
+    """ImagePasteTool's own fixed bottom-right progress window.
+
+    It is NOT a Windows toast.
+    It stays above normal application windows but does not intentionally take
+    keyboard focus from PureRef / browser / ChatGPT.
+    """
+    WIDTH = 340
+
+    def __init__(self, master):
+        self.top = tk.Toplevel(master)
+        self.top.withdraw()
+        self.top.overrideredirect(True)
+        try:
+            self.top.attributes("-topmost", True)
+        except Exception:
+            pass
+        try:
+            self.top.attributes("-alpha", 0.97)
+        except Exception:
+            pass
+
+        self.frame = tk.Frame(
+            self.top,
+            bg="#1F2023",
+            padx=14,
+            pady=12,
+            highlightbackground="#4A4D52",
+            highlightthickness=1
+        )
+        self.frame.pack(fill="both", expand=True)
+
+        self.title = tk.Label(
+            self.frame,
+            text="ImagePasteTool",
+            font=("Segoe UI", 11, "bold"),
+            bg="#1F2023",
+            fg="#FFFFFF",
+            anchor="w"
+        )
+        self.title.pack(fill="x")
+
+        self.detail = tk.Label(
+            self.frame,
+            text="",
+            font=("Segoe UI", 9),
+            bg="#1F2023",
+            fg="#DADCE0",
+            anchor="w",
+            justify="left",
+            wraplength=self.WIDTH - 28
+        )
+        self.detail.pack(fill="x", pady=(4, 9))
+
+        self.canvas = tk.Canvas(
+            self.frame,
+            width=self.WIDTH - 28,
+            height=8,
+            bg="#3C4043",
+            highlightthickness=0,
+            bd=0
+        )
+        self.canvas.pack(fill="x")
+        self.bar = self.canvas.create_rectangle(
+            0, 0, 0, 8,
+            fill="#E8EAED",
+            outline=""
+        )
+
+        self.hide_job = None
+        self.busy_job = None
+        self.busy_phase = 0.0
+        self.is_showing = False
+
+        # Force creation of a real native HWND before applying no-activate style.
+        self.top.update_idletasks()
+        self._make_noactivate()
+
+    def _make_noactivate(self):
+        try:
+            hwnd = self.top.winfo_id()
+            style = _GetWindowLong(hwnd, GWL_EXSTYLE)
+            _SetWindowLong(
+                hwnd,
+                GWL_EXSTYLE,
+                style | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+            )
+        except Exception:
+            pass
+
+    def _position(self):
+        self.top.update_idletasks()
+        width = max(self.WIDTH, self.top.winfo_reqwidth())
+        height = max(86, self.top.winfo_reqheight())
+        sw = self.top.winfo_screenwidth()
+        sh = self.top.winfo_screenheight()
+
+        # Keep a clear gap above the Windows taskbar / bottom edge.
+        x = max(8, sw - width - 24)
+        y = max(8, sh - height - 72)
+        self.top.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _cancel_jobs(self):
+        if self.hide_job is not None:
+            try:
+                self.top.after_cancel(self.hide_job)
+            except Exception:
+                pass
+            self.hide_job = None
+        if self.busy_job is not None:
+            try:
+                self.top.after_cancel(self.busy_job)
+            except Exception:
+                pass
+            self.busy_job = None
+
+    def _show_noactivate(self):
+        self._position()
+
+        # Tk deiconify is more reliable than only calling Win32 ShowWindow on a
+        # withdrawn Toplevel. We never call focus_force/focus_set.
+        try:
+            self.top.deiconify()
+            self.top.lift()
+            self.top.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        self.top.update_idletasks()
+
+        try:
+            hwnd = self.top.winfo_id()
+            self._make_noactivate()
+            user32.SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0, 0, 0, 0,
